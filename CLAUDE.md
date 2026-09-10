@@ -15,8 +15,8 @@ file actually lives here.
 ## Commands
 
 ```bash
-uv run proofline_eval.py all --profile smoke     # ~2s,  400 cards — does it work
-uv run proofline_eval.py all --profile quick     # ~7s,  2500 cards — the default
+uv run proofline_eval.py all --profile smoke     # ~2s,  400 cards, does it work
+uv run proofline_eval.py all --profile quick     # ~7s,  2500 cards, the default
 uv run proofline_eval.py all --profile full      # ~50s, 12000 cards, 3 scale points
 
 uv run proofline_eval.py b1                      # one branch, reusing seeded data
@@ -33,8 +33,7 @@ uv run proofline_eval.py seed | ingest           # stages, run separately
 - No test suite. The check is a run: `smoke` for a code path, `quick` for numbers.
   `assert_no_truth_leak()` runs before every branch and is the closest thing to a test.
 - `--embedder sentence-transformers` downloads ~90MB on first use; `--judge openai,anthropic`
-  costs real money (~$0.50 at `--judge-pairs 80`). Both keys come from `.env` only —
-  nothing reads a key from argv.
+  costs real money (~$0.50 at `--judge-pairs 80`). Both keys come from `.env` only: nothing reads a key from argv.
 - Reports: `.proofline/reports/report-<UTC>.json`, one per run, containing everything printed.
 - `PROOFLINE_STATE` relocates `.proofline/`; `DATABASE_URL` replaces the embedded server
   (needed on linux-aarch64, where `pgserver` has no wheel).
@@ -45,7 +44,7 @@ Sections are numbered `§0`–`§12` in comment banners; grep those to navigate.
 
 ```
 §0  Config      PROFILES dict + Config dataclass (every CLI flag lands here)
-§1  Corpus      build_corpus() — synthetic record with PLANTED ground truth
+§1  Corpus      build_corpus(), synthetic record with PLANTED ground truth
 §2  Storage     SCHEMA + Store: snapshot(), subset(), COPY-based bulk load
 §3  Embeddings  hash (default, offline) | sentence-transformers | openai
 §4  Index       one Index per corpus size; snapshots are a boolean mask, not a rebuild
@@ -53,7 +52,7 @@ Sections are numbered `§0`–`§12` in comment banners; grep those to navigate.
 §6  Metrics     ndcg_at_k(condensed=), bpref, mrr, recall
 §7  Statistics  bootstrap_ci, paired_power, mcnemar, cohen_kappa, kendall_tau
 §8  Judges      MockJudge (simulator w/ injected bias) | HTTPJudge (openai/anthropic)
-§9  Tracing     Tracer — Langfuse shim, no-ops without keys, survives v2/v3 split
+§9  Tracing     Tracer, Langfuse shim, no-ops without keys, survives v2/v3 split
 §10 Harness     execute_run → score_runs (pooled) → paired; hard_checks
 §11 Branches    branch1_labels .. branch4_loop, one per experiment
 §12 CLI         cmd_seed, cmd_ingest, write_report, main
@@ -63,7 +62,7 @@ Flow: `main` → seed (§1→§2) → ingest (§3 embeddings + simulated click l
 `branchN(store, cfg, embedder, tracer)` → JSON report. Each branch returns a dict that
 becomes `payload[bN]`; anything printed must also be in that dict.
 
-## Invariants — these are the point of the file, not incidental
+## Invariants: these are the point of the file, not incidental
 
 Breaking one of these silently invalidates every number downstream.
 
@@ -73,7 +72,7 @@ Breaking one of these silently invalidates every number downstream.
    breaks the guard silently. Nothing on the retrieval/scoring path may read
    `edges.kind = 'true_support'`.
 2. **Paired, never two means.** Comparisons go through `paired()` + `bootstrap_ci()` over
-   the same query ids. `verdict_of()` returns BETTER / WORSE / **UNDERPOWERED** — the
+   the same query ids. `verdict_of()` returns BETTER / WORSE / **UNDERPOWERED**. The
    third is a real verdict, not a fallback.
 3. **Condensed nDCG + bpref, not `recall@k`.** Mined judgments are incomplete, so
    unjudged ≠ irrelevant. `score_runs()` pools the judgment set across *all* runs before
@@ -99,7 +98,7 @@ Breaking one of these silently invalidates every number downstream.
    are evidence about the harness, never about a judge.
 9. **Abstention is a binary decision at a matched false-abstention rate**
    (`calibrate_abstain`, `cfg.abstain_fabr`), fitted on a dev split and reported held-out.
-   B4 holds out **by proofline**, not by query — the leak is at the record level.
+   B4 holds out **by proofline**, not by query: the leak is at the record level.
 
 ## Extending
 
@@ -108,7 +107,7 @@ Breaking one of these silently invalidates every number downstream.
   class to the list literal building `SCORERS`. `--baseline`/`--candidate` choices derive
   from that dict, so nothing else needs touching.
 - **New CLI flag**: `argparse` in `main()` *and* the `Config` field *and* the `Config(...)`
-  construction — three places, all in one screen.
+  construction, three places, all in one screen.
 - **Real data instead of synthetic**: fill `cards` and `edges` (`kind` in
   `parent`/`citation`), leave `true_support` empty. Every branch runs except B1's
   label-source comparison, which needs planted truth to grade labels against.

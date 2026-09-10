@@ -12,7 +12,7 @@
 # ]
 # ///
 """
-proofline_eval.py — a single-file retrieval evaluation harness.
+proofline_eval.py: a single-file retrieval evaluation harness.
 
 Problem it answers
 ------------------
@@ -442,7 +442,7 @@ def build_corpus(cfg: Config, n_cards: int, n_prooflines: int) -> Corpus:
 
     queries: dict[str, list[Query]] = defaultdict(list)
 
-    # (a) PLANTED — the honest set. Query paraphrases the information need; relevance is
+    # (a) PLANTED: the honest set. Query paraphrases the information need; relevance is
     #     the true support, plus one grade of transitive support. This is the yardstick
     #     the other three label sources are judged against. In production it does not
     #     exist; that is the whole problem. Here it does, so we can score the scorers'
@@ -477,7 +477,7 @@ def build_corpus(cfg: Config, n_cards: int, n_prooflines: int) -> Corpus:
                     + (["recently_changed"] if recent else [])),
             answerable=True))
 
-    # (b) DAG-MINED — the proposal from the brief. Query = the card's one-liner (short,
+    # (b) DAG-MINED: the proposal from the brief. Query = the card's one-liner (short,
     #     abstracted, NOT its body). Relevance = the links the author recorded.
     #     Incomplete and rank-biased by construction; B1 measures by how much.
     for i, c in enumerate(current[:n_q]):
@@ -492,7 +492,7 @@ def build_corpus(cfg: Config, n_cards: int, n_prooflines: int) -> Corpus:
             as_of=c.committed_at, source_card=c.id, rel=rel,
             slices=["short" if len(toks) < 6 else "long"], answerable=True))
 
-    # (c) GENERATED — a model writes a query from a piece, in the piece's own words.
+    # (c) GENERATED: a model writes a query from a piece, in the piece's own words.
     #     Known-item, single relevant doc, huge lexical overlap. Smoke test, not a
     #     benchmark: card REVVD5's point, made measurable.
     for i, c in enumerate(current[:n_q]):
@@ -502,12 +502,12 @@ def build_corpus(cfg: Config, n_cards: int, n_prooflines: int) -> Corpus:
             source_card=c.id, rel={c.id: 2.0},
             slices=["long"], answerable=True))
 
-    # (d) USAGE-MINED — a simulated click log. The "user" only ever saw the incumbent's
+    # (d) USAGE-MINED: a simulated click log. The "user" only ever saw the incumbent's
     #     top 3, so the label is whatever the incumbent surfaced that was also true.
     #     Rewards the incumbent by construction. Filled in after ingestion (needs the
     #     incumbent's rankings), see build_usage_mined().
 
-    # (e) NO-ANSWER — needs from the withheld topic. Correct behaviour is to return
+    # (e) NO-ANSWER: needs from the withheld topic. Correct behaviour is to return
     #     nothing. Scored as abstention, never as nDCG.
     wpool = topics[withheld_topic]
     latest = max(c.committed_at for c in cards)
@@ -764,7 +764,7 @@ def build_corpus_arxiv(cfg: Config, n_cards: int) -> Corpus:
 
 
 # ----------------------------------------------------------------------------------
-# §2  Storage — Postgres
+# §2  Storage: Postgres
 # ----------------------------------------------------------------------------------
 #
 # Postgres and not Mongo, for three reasons that matter to this problem specifically:
@@ -773,7 +773,7 @@ def build_corpus_arxiv(cfg: Config, n_cards: int) -> Corpus:
 #   * tsvector/GIN gives a real lexical scorer with no extra dependency
 #
 # And deliberately NO pgvector. At a few thousand to tens of thousands of pieces,
-# brute-force cosine over a float32 matrix is single-digit milliseconds — faster than
+# brute-force cosine over a float32 matrix is single-digit milliseconds, faster than
 # an unindexed pgvector scan and with no install step. ANN indexing is a problem this
 # product does not have yet, and pretending otherwise costs a dependency and a lie.
 # ----------------------------------------------------------------------------------
@@ -1010,7 +1010,7 @@ class Embedder:
 
 class HashEmbedder(Embedder):
     """Signed random projection of word + char-3gram hashes. No download, no key,
-    deterministic. It is a *lexical-ish* vector, not a semantic one — good enough to
+    deterministic. It is a *lexical-ish* vector, not a semantic one, good enough to
     exercise every code path offline, and honest about what it is. Use
     sentence-transformers for a real dense scorer."""
 
@@ -1442,7 +1442,7 @@ def check_circularity(scorer: Scorer, label_src: str) -> Optional[str]:
 #
 # The default is condensed-list nDCG, not recall@k. With mined labels the judgment set
 # is INCOMPLETE, so an unjudged document is unknown, not irrelevant. recall@k punishes
-# the scorer that surfaces something genuinely relevant the author never linked — which
+# the scorer that surfaces something genuinely relevant the author never linked, which
 # is precisely the scorer you were hoping to find.
 # ----------------------------------------------------------------------------------
 
@@ -1577,7 +1577,7 @@ def kendall_tau(a: Sequence[float], b: Sequence[float]) -> float:
 # ----------------------------------------------------------------------------------
 #
 # The judge is treated as an INSTRUMENT, not an oracle. Every judge here is:
-#   * pairwise, never absolute — it compares two ranked lists, it does not score one
+#   * pairwise, never absolute: it compares two ranked lists, it does not score one
 #   * run twice with the order swapped, so position bias is measured on every item
 #   * calibrated against a reference set, and reported with its kappa
 # A judge whose kappa against the reference is not stated is a number with no units.
@@ -1599,7 +1599,7 @@ the query, and whether obviously redundant or outdated items crowd out useful on
 Answer with exactly one word: A, B, or TIE."""
 
 
-Item = tuple[str, str]   # (card_id, rendered text) — judges see one or the other
+Item = tuple[str, str]   # (card_id, rendered text), judges see one or the other
 
 
 class Judge:
@@ -1951,7 +1951,7 @@ class Tracer:
 
 
 # ----------------------------------------------------------------------------------
-# §10  Harness — run scorers, pool, score
+# §10  Harness: run scorers, pool, score
 # ----------------------------------------------------------------------------------
 
 @dataclass
@@ -2209,7 +2209,7 @@ def build_usage_mined(store: Store, cfg: Config, embedder: Embedder,
 
 def branch1_labels(store: Store, cfg: Config, embedder: Embedder,
                    tracer: Tracer) -> dict:
-    """B1 — Gold from nowhere.
+    """B1: Gold from nowhere.
 
     The question the proofline asks is 'where do labels come from'. The question that
     actually decides anything is 'does a label source pick the same winner the truth
@@ -2217,7 +2217,7 @@ def branch1_labels(store: Store, cfg: Config, embedder: Embedder,
     good SELECTOR, and it can look precise and still choose wrong. So we measure the
     verdict, not the label.
     """
-    rule("B1  GOLD FROM NOWHERE — do mined labels pick the same winner as the truth?")
+    rule("B1  GOLD FROM NOWHERE: do mined labels pick the same winner as the truth?")
     a_name, b_name = cfg.baseline, cfg.candidate
     out: dict[str, Any] = {"sources": {}}
     truth_verdict = None
@@ -2319,8 +2319,8 @@ def branch1_labels(store: Store, cfg: Config, embedder: Embedder,
 
 def branch2_judge(store: Store, cfg: Config, embedder: Embedder,
                   tracer: Tracer) -> dict:
-    """B2 — Judge or metric. The judge is calibrated here, not trusted."""
-    rule("B2  JUDGE OR METRIC — calibrating the instrument before believing it")
+    """B2: Judge or metric. The judge is calibrated here, not trusted."""
+    rule("B2  JUDGE OR METRIC: calibrating the instrument before believing it")
     qs = [q for q in load_queries(store, cfg.eval_provenance) if q.answerable][:cfg.judge_pairs]
     if not qs:
         return {}
@@ -2416,8 +2416,8 @@ def branch2_judge(store: Store, cfg: Config, embedder: Embedder,
 
 def branch3_scale(store: Store, cfg: Config, embedder: Embedder,
                   tracer: Tracer) -> dict:
-    """B3 — The long record: scale, distractors, and abstention."""
-    rule("B3  THE LONG RECORD — scale, distractor taxonomy, and saying nothing")
+    """B3: The long record: scale, distractors, and abstention."""
+    rule("B3  THE LONG RECORD: scale, distractor taxonomy, and saying nothing")
     qs = [q for q in load_queries(store, cfg.eval_provenance) if q.answerable]
     if not qs:
         log(f"  no answerable queries with provenance '{cfg.eval_provenance}'; "
@@ -2548,14 +2548,14 @@ def branch3_scale(store: Store, cfg: Config, embedder: Embedder,
             out["abstention"]["power"] = dict(n=n, observed_gap=p2 - p1, n_required=need)
             log(f"    gap = {p2-p1:+.1%} on n={n}.  To call a gap that size at 80% power "
                 f"you need ~{need} no-answer queries.")
-            log(f"    -> {'ENOUGH' if n >= need else 'NOT ENOUGH — this number cannot support a claim'}")
+            log(f"    -> {'ENOUGH' if n >= need else 'NOT ENOUGH, this number cannot support a claim'}")
     return out
 
 
 def branch4_loop(store: Store, cfg: Config, embedder: Embedder,
                  tracer: Tracer) -> dict:
-    """B4 — Run it every day: the comparison table and the release gate."""
-    rule("B4  RUN IT EVERY DAY — the table, the slices, the power, the gate")
+    """B4: Run it every day: the comparison table and the release gate."""
+    rule("B4  RUN IT EVERY DAY: the table, the slices, the power, the gate")
     qs_all = load_queries(store, cfg.eval_provenance)
     qs = [q for q in qs_all if q.answerable]
     if not qs:

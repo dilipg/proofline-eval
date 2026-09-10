@@ -118,14 +118,14 @@ strong{font-weight:600}
   <h1>Four Branches on arXiv</h1>
   <p class="lede">The scorer-evaluation brief was written against a synthetic corpus
   with planted ground truth. This is what happens when all four of its branches are
-  run against 60,001 real arXiv cards instead &mdash; where nothing is planted, the
+  run against 60,001 real arXiv cards instead: where nothing is planted, the
   citation graph is genuinely incomplete, and half the record is superseded.</p>
 </header>
 
 <section>
   <h2>What was measured</h2>
   <p>158,160 arXiv papers were joined to the ogbn-arxiv citation graph, then a
-  connected subgraph was grown by snowball sampling &mdash; random sampling would have
+  connected subgraph was grown by snowball sampling: random sampling would have
   kept only ~(2.5/158)&sup2; of the edges and destroyed the graph that makes this
   corpus worth using. Every paper <em>version</em> becomes its own card, chained by
   <code>supersedes_id</code>, so supersession is real rather than synthesised.</p>
@@ -142,7 +142,7 @@ strong{font-weight:600}
   <p>Embeddings are SPECTER2 (768-dim), which is asymmetric: documents encode through
   the <code>proximity</code> adapter, queries through <code>adhoc_query</code>. Four
   candidates were compared against a <code>bm25</code> baseline. The 30-year span is not
-  incidental &mdash; a query dated 1998 is answered against a corpus holding nothing
+  incidental: a query dated 1998 is answered against a corpus holding nothing
   after 1998, so the brief's argument that a frozen test set goes <em>wrong</em> rather
   than merely stale has three decades of room to bite.</p>
 </section>
@@ -154,7 +154,7 @@ strong{font-weight:600}
 
   <p class="col">With no planted truth and no humans, the anchor is a calibrated judge
   scoring the two rankings directly on realistic queries (paper titles) with no labels
-  at all &mdash; which is what makes it independent of the sources it grades.</p>
+  at all, which is what makes it independent of the sources it grades.</p>
 
   <div class="tw"><table>
     <caption>bm25 vs hybrid_rrf_fresh. Anchors judged 120 queries, order-swapped, zero errors.</caption>
@@ -171,18 +171,18 @@ strong{font-weight:600}
         <td class="n">[&minus;0.206, &minus;0.165]</td><td><span class="pill p-fail">WORSE</span></td>
         <td><span class="pill p-fail">OPPOSITE</span></td></tr>
       <tr><td class="name">anchor &middot; haiku-4-5</td><td class="n">120</td><td class="n">+0.650</td>
-        <td class="n">[+0.550, +0.750]</td><td><span class="pill p-pass">BETTER</span></td><td>&mdash;</td></tr>
+        <td class="n">[+0.550, +0.750]</td><td><span class="pill p-pass">BETTER</span></td><td class="n">n/a</td></tr>
       <tr><td class="name">anchor &middot; sonnet-5</td><td class="n">120</td><td class="n">+0.783</td>
-        <td class="n">[+0.675, +0.883]</td><td><span class="pill p-pass">BETTER</span></td><td>&mdash;</td></tr>
+        <td class="n">[+0.675, +0.883]</td><td><span class="pill p-pass">BETTER</span></td><td class="n">n/a</td></tr>
     </tbody>
   </table></div>
 
   <p class="col"><code>dag_mined</code> and <code>usage_mined</code> differ by
   <strong>0.218 nDCG</strong> on the same corpus, the same two scorers, the same
-  afternoon &mdash; and land on opposite sides of the ship/block line. Both are free,
+  afternoon, and land on opposite sides of the ship/block line. Both are free,
   both derive from data the product already holds, and both look entirely respectable
-  in isolation. That is the brief's thesis &mdash; label <em>quality</em> and label
-  <em>usefulness</em> are different properties &mdash; demonstrated rather than argued.</p>
+  in isolation. That is the brief's thesis: label <em>quality</em> and label
+  <em>usefulness</em> are different properties, demonstrated rather than argued.</p>
 
   <p class="col">The direction is predictable in hindsight. <code>usage_mined</code>
   labels are built from what the incumbent surfaced in its own top 3, so a scorer that
@@ -200,7 +200,7 @@ strong{font-weight:600}
       <tr><td class="name">usage_mined</td><td><span class="pill p-pass">RUN</span></td>
         <td>simulated click log over the incumbent</td></tr>
       <tr><td class="name">author-labelled</td><td><span class="pill p-warn">UNAVAILABLE</span></td>
-        <td>no humans in this loop &mdash; a judge stood in</td></tr>
+        <td>no humans in this loop, a judge stood in</td></tr>
       <tr><td class="name">interleaving</td><td><span class="pill p-warn">UNAVAILABLE</span></td>
         <td>no live traffic to interleave</td></tr>
     </tbody>
@@ -216,12 +216,12 @@ strong{font-weight:600}
   'dag_mined' are derived from it. The comparison would score the scorer on its own
   feature.</div>
   <p class="col">Against the two sources that <em>could</em> score it,
-  <code>graph_boost</code> is catastrophic &mdash; &minus;0.665 on
+  <code>graph_boost</code> is catastrophic: &minus;0.665 on
   <code>generated</code>, &minus;0.497 on <code>usage_mined</code>; in-degree promotes
   heavily-cited papers, which is precisely wrong when the task is to find one specific
   paper. But that is the side note. The finding is that the only label source which
   picked the right winner is also the one that disqualifies any scorer reading graph
-  structure &mdash; while the brief's own recommended stack includes graph-aware
+  structure, while the brief's own recommended stack includes graph-aware
   retrieval (&sect;6.10). Those two recommendations collide, and the collision is
   invisible unless the guard is mechanical.</p>
 </section>
@@ -229,7 +229,7 @@ strong{font-weight:600}
 <section>
   <div class="branch"><span class="tag">B</span><h2>Judge or metric</h2></div>
   <div class="stamp">Two judges agreed with each other at kappa <strong>0.462</strong>
-  &mdash; and they are from the same family, so that is an optimistic ceiling.</div>
+, and they are from the same family, so that is an optimistic ceiling.</div>
 
   <div class="tw"><table>
     <caption>150 pairs, bm25 vs hybrid_rrf_fresh. Noise floor measured separately over 100 repeated identical calls.</caption>
@@ -246,7 +246,7 @@ strong{font-weight:600}
   </table></div>
 
   <p class="col">The more reliable judge is the less useful one. Sonnet 5 is markedly
-  more self-consistent and barely position-biased &mdash; and agrees with the ranking
+  more self-consistent and barely position-biased, and agrees with the ranking
   metric <em>not at all</em> (&kappa; = &minus;0.007). Haiku is noisier and more biased,
   yet tracks nDCG better. A judge cannot be selected on reliability alone.</p>
 
@@ -254,13 +254,13 @@ strong{font-weight:600}
   <p class="col">Swap-inconsistency is read throughout the brief as position bias. That
   only holds for a deterministic judge, and ours is not: removing
   <code>temperature: 0</code> to satisfy Sonnet 5, which rejects the parameter outright,
-  left every Anthropic judge sampling &mdash; two runs over identical inputs returned
+  left every Anthropic judge sampling: two runs over identical inputs returned
   &kappa; of +0.121 and +0.197.</p>
   <p class="col">So the same pair was judged twice in the <em>same</em> order. Any flip
   there involves no position change at all:</p>
   <div class="stamp" style="border-left-color:var(--muted); background:var(--rule-soft)">
   swap-flip rate = noise + position &nbsp;&rarr;&nbsp; position = swap &minus; floor</div>
-  <p class="col">Both judges' swap rates survive the correction &mdash; position bias is
+  <p class="col">Both judges' swap rates survive the correction: position bias is
   real and dominant. But roughly a sixth of Haiku's raw 25.3% was the judge disagreeing
   with itself, a different defect with a different fix (sample twice and take the mode).
   Without this control the two are indistinguishable.</p>
@@ -325,7 +325,7 @@ strong{font-weight:600}
   queries whose evidence is genuinely absent from the corpus; both candidates never do.
   The effect is so large that <strong>~16</strong> no-answer queries would suffice to
   call it. The brief worries you need several hundred and nobody wants to write them;
-  here the subsetting produced them for free &mdash; every no-answer query is the title
+  here the subsetting produced them for free: every no-answer query is the title
   of a real paper held outside the sampled corpus, so its emptiness is verifiable rather
   than asserted.</p>
 </section>
@@ -358,15 +358,14 @@ strong{font-weight:600}
   </table></div>
 
   <p class="col">Nothing came back <code>UNDERPOWERED</code>. At n = 1,483 the minimum
-  detectable effect is 0.005&ndash;0.023, and 84 to 178 queries — depending on the
-  candidate — would resolve the 0.02
+  detectable effect is 0.005&ndash;0.023, and 84 to 178 queries, depending on the
+  candidate, would resolve the 0.02
   target. The same harness on the synthetic corpus at n = 219 returned UNDERPOWERED on
   every single slice. That contrast is the brief's sizing argument made concrete: the
   test set was the binding constraint, not the scorers.</p>
 
   <p class="col">Two details worth trusting. <code>recently_changed</code> is
-  <code>hybrid_rrf_fresh</code>'s strongest slice (+0.054, double its overall) &mdash;
-  precisely where a freshness filter should pay, so the mechanism is working as designed
+  <code>hybrid_rrf_fresh</code>'s strongest slice (+0.054, double its overall), precisely where a freshness filter should pay, so the mechanism is working as designed
   rather than by accident. And the held-out-proofline slice beats the dev split for all
   three candidates (+0.054 vs +0.037 for rerank), which is the opposite of the leakage
   pattern the brief warns about.</p>
@@ -395,13 +394,12 @@ strong{font-weight:600}
   <p class="col"><strong>&ldquo;Build D as a reporter first&rdquo; is no longer a
   caution.</strong> The identical Branch D machinery, pointed at <code>usage_mined</code>
   instead of <code>dag_mined</code>, returns WORSE and blocks <code>hybrid_rrf_fresh</code>
-  &mdash; the candidate that ships on every hard check and every slice. Not a hypothetical
+, the candidate that ships on every hard check and every slice. Not a hypothetical
   about automating confident wrong answers on a schedule; a specific release decision
   inverted by a label-source choice, where both sources look respectable.</p>
 
   <p class="col"><strong>One place the data pushes back.</strong> C sits third as an
-  evaluation branch, and that is right for build order. But its single idea &mdash;
-  moving supersession out of the ranker and into the candidate set &mdash; was the
+  evaluation branch, and that is right for build order. But its single idea, moving supersession out of the ranker and into the candidate set, was the
   largest retrieval win measured here <em>and</em> the change that flipped the gate.
   On the build-order axis C is third; on the &ldquo;what actually improved retrieval&rdquo;
   axis its one insight beat everything else tried, including the cross-encoder.</p>
@@ -410,14 +408,14 @@ strong{font-weight:600}
   consumed real money, three failed runs and several hours of wall clock, and returned
   two judges agreeing with each other only moderately and the more reliable of them
   agreeing with the ranking metric not at all. Its one load-bearing use was anchoring
-  Branch A &mdash; a service to A rather than a branch in its own right.</p>
+  Branch A, a service to A rather than a branch in its own right.</p>
 </section>
 
 <section>
   <h2>What the numbers confirm, and one place they correct</h2>
 
   <div class="stamp">The upstream bundle is worth <strong>2.3&times;</strong> the gap
-  between the two scorers under debate. The brief's caveat holds &mdash; and that is a
+  between the two scorers under debate. The brief's caveat holds, and that is a
   floor, since field-weighted lexical was never tested.</div>
 
   <p class="col">The brief warns that if the goal is better retrieval rather than better
@@ -429,7 +427,7 @@ strong{font-weight:600}
     <caption>Branch D, n = 1,483. Each step measured over the one above it, same queries, same baseline.</caption>
     <thead><tr><th>Step</th><th class="n">nDCG@10</th><th class="n">Gain</th><th>Role</th></tr></thead>
     <tbody>
-      <tr><td class="name">bm25</td><td class="n">0.0516</td><td class="n">&mdash;</td>
+      <tr><td class="name">bm25</td><td class="n">0.0516</td><td class="n">, </td>
         <td>the incumbent</td></tr>
       <tr><td class="name">+ RRF fusion &rarr; hybrid_rrf</td><td class="n">0.0636</td>
         <td class="n">+0.0119</td><td>the gap under debate</td></tr>
@@ -441,7 +439,7 @@ strong{font-weight:600}
   </table></div>
 
   <p class="col">The two scorers whose comparison the whole exercise exists to settle
-  differ by <strong>+0.0119</strong> &mdash; the <em>smallest</em> of the three steps.
+  differ by <strong>+0.0119</strong>, the <em>smallest</em> of the three steps.
   The upstream work still on the table is worth <strong>+0.0274</strong>, or
   <strong>2.30&times;</strong> as much. Three months of measurement would resolve the
   smaller number.</p>
@@ -449,7 +447,7 @@ strong{font-weight:600}
   <p class="col">The one correction is narrower than it first looks. Within that bundle
   the candidate-set filter (+0.0155) is at least as large as the cross-encoder
   (+0.0119), so &ldquo;reranking is probably the single largest available win&rdquo;
-  does not hold &mdash; the cheap metadata filter edges the model. But the two steps are
+  does not hold: the cheap metadata filter edges the model. But the two steps are
   close, and separating them properly needs a paired test on the difference, which was
   not run.</p>
 
@@ -458,7 +456,7 @@ strong{font-weight:600}
     <li><strong>&ldquo;Every branch except B1's label comparison runs unchanged on real
     data&rdquo; is false.</strong> Six sites outside Branch A hardcoded the
     <code>planted</code> provenance. With real data they evaluate <em>zero queries</em>
-    and report success rather than failing &mdash; the branches are downstream of A in
+    and report success rather than failing: the branches are downstream of A in
     code, not only in argument.</li>
     <li><strong>Swap-inconsistency is not position bias</strong> without a noise control,
     and the brief treats them as one quantity throughout.</li>
@@ -466,7 +464,7 @@ strong{font-weight:600}
     judged document into every scale point; real papers cite ~19 others, so a large
     query set pins more documents than the smallest point holds and the &ldquo;6k&rdquo;
     point silently becomes 30k. Sampling had to run against a judged-document budget,
-    not a query count &mdash; the Branch C trap, one level up from where the brief
+    not a query count: the Branch C trap, one level up from where the brief
     catches it.</li>
   </ul>
 </section>
@@ -480,7 +478,7 @@ strong{font-weight:600}
   <p><strong>Both judges are from one family.</strong> The cross-family comparison the
   brief asks for was blocked by an exhausted daily quota. Two Anthropic models should
   agree <em>more</em> than two from different vendors, so &kappa; = 0.462 is an
-  optimistic ceiling &mdash; which strengthens rather than weakens the conclusion.</p>
+  optimistic ceiling, which strengthens rather than weakens the conclusion.</p>
   <p><strong>Some hard-check zeros are true by construction.</strong>
   <code>hybrid_rrf_fresh</code> and <code>rerank</code> filter to current versions, so
   they cannot rank a superseded card above its successor. That is the design working as
@@ -489,16 +487,16 @@ strong{font-weight:600}
   scorers can never retrieve.</p>
   <p><strong>The distractor taxonomy collapsed.</strong> Setting
   <code>proofline_id</code> to the arXiv category made &ldquo;sibling in the same
-  proofline&rdquo; mean &ldquo;same category&rdquo; &mdash; nearly every paper. It reads
+  proofline&rdquo; mean &ldquo;same category&rdquo;, nearly every paper. It reads
   100% for both candidates and tells you nothing. A finer grouping would fix it.</p>
   <p><strong>A specified cross-check was not built.</strong> The design called for
-  grading <code>dag_mined</code> a second way &mdash; splitting each paper's citations,
-  mining labels from one half and testing the verdict against the other &mdash; as a
+  grading <code>dag_mined</code> a second way: splitting each paper's citations,
+  mining labels from one half and testing the verdict against the other, as a
   model-free check on the judge anchor. It was not implemented, because doing it
   properly means re-deriving the labels and re-seeding. Branch A therefore rests on the
   judge anchor alone, with no independent corroboration.</p>
   <p><strong>9.7% of citation edges were lost</strong> in the MAG&harr;arXiv title join,
-  and the loss is not random &mdash; it skews toward older and oddly-formatted records,
+  and the loss is not random: it skews toward older and oddly-formatted records,
   adding a second layer of incompleteness on top of the real one Branch A studies.</p>
   </div>
 </section>
@@ -514,7 +512,7 @@ strong{font-weight:600}
   n = 219 every slice was underpowered and no verdict was resolvable; on 60,001 real
   cards at n = 1,483 every verdict is decisive and the binding constraint turns out to
   have been the test set all along. The most consequential single decision in the whole
-  exercise was not which scorer to use &mdash; it was <em>which label source to believe</em>,
+  exercise was not which scorer to use. It was <em>which label source to believe</em>,
   where two free, plausible, internally-consistent options disagree by 0.218 nDCG and
   point to opposite release decisions.</p>
 
