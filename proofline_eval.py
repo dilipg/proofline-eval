@@ -1663,9 +1663,10 @@ class HTTPJudge(Judge):
             self.model = os.environ.get("OPENAI_JUDGE_MODEL", "gpt-4o-mini")
         elif provider == "anthropic":
             self.key = os.environ["ANTHROPIC_API_KEY"]
-            # Sonnet 5 and Opus 5 REFUSE this corpus (stop_reason=refusal,
-            # categories bio / cyber): the synthetic vocabulary reads as
-            # pseudo-biochemistry. Haiku 4.5 answers it cleanly.
+            # Sonnet 5 and Opus 5 refuse the SYNTHETIC corpus outright
+            # (stop_reason=refusal, categories bio / cyber): its generated
+            # vocabulary reads as pseudo-biochemistry. Both answer real arXiv
+            # abstracts cleanly. Haiku 4.5 answers either, so it is the default.
             self.model = os.environ.get("ANTHROPIC_JUDGE_MODEL", "claude-haiku-4-5")
         else:
             raise SystemExit(f"unknown judge {provider}")
@@ -1731,10 +1732,28 @@ class HTTPJudge(Judge):
                 r = self._post(
                     "https://api.openai.com/v1/chat/completions",
                     {"Authorization": f"Bearer {self.key}"},
-                    {"model": self.model, "temperature": 0, "max_tokens": 4,
-                     "messages": [{"role": "user", "content": prompt}]})
+                    # Same instruction and the same room to answer as the Anthropic
+                    # branch. Cross-judge agreement only means something if both
+                    # judges were asked the same question; a terseness prompt on one
+                    # side and a 4-token ceiling on the other is two questions.
+                    {"model": self.model, "temperature": 0, "max_tokens": 256,
+                     "messages": [
+                         {"role": "system",
+                          "content": "Reply with exactly one word: A, B, or TIE. "
+                                     "No explanation, no analysis, no preamble."},
+                         {"role": "user", "content": prompt}]})
                 d = r.json()
-                out = d["choices"][0]["message"]["content"]
+                ch = (d.get("choices") or [{}])[0]
+                # A reply cut off mid-sentence is not a verdict. Parsing it yields
+                # TIE, because it starts with neither A nor B, and a fabricated tie
+                # is invisible: it inflates the tie rate and the swap-inconsistency
+                # rate while n_errors still reads zero.
+                if ch.get("finish_reason") == "length":
+                    raise RuntimeError("verdict truncated at max_tokens, not a TIE")
+                out = (ch.get("message") or {}).get("content")
+                if out is None:
+                    raise RuntimeError(
+                        f"no content (finish_reason={ch.get('finish_reason')})")
                 u = d.get("usage") or {}
                 usage = {"input": u.get("prompt_tokens", 0),
                          "output": u.get("completion_tokens", 0)}

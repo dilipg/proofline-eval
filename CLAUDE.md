@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repo
 
-One file: [proofline_eval.py](proofline_eval.py) (~2250 lines). A retrieval-eval harness
+One file: [proofline_eval.py](proofline_eval.py) (~2900 lines). A retrieval-eval harness
 that answers "which of two scorers is better, on a record nobody labelled". No package,
 no tests dir, no build. Docs: [README.md](README.md) (usage + the positions it takes),
-[docs/HARNESS-NOTES.md](docs/HARNESS-NOTES.md) (why the stack, and four bugs it caught).
+`docs/HARNESS-NOTES.md` (why the stack; gitignored, local only).
 
 Not a git repo. Both docs reference an old path (`~/ai-agents-lab/proofline-eval`); the
 file actually lives here.
@@ -45,10 +45,11 @@ Sections are numbered `§0`–`§12` in comment banners; grep those to navigate.
 ```
 §0  Config      PROFILES dict + Config dataclass (every CLI flag lands here)
 §1  Corpus      build_corpus(), synthetic record with PLANTED ground truth
+§1b Real corpus build_corpus_arxiv(), arXiv metadata + ogbn-arxiv citations
 §2  Storage     SCHEMA + Store: snapshot(), subset(), COPY-based bulk load
-§3  Embeddings  hash (default, offline) | sentence-transformers | openai
+§3  Embeddings  hash (offline) | sentence-transformers | openai | specter2
 §4  Index       one Index per corpus size; snapshots are a boolean mask, not a rebuild
-§5  Scorers     SCORERS registry, check_circularity()
+§5  Scorers     SCORERS registry, check_circularity(), CrossEncoderRerank
 §6  Metrics     ndcg_at_k(condensed=), bpref, mrr, recall
 §7  Statistics  bootstrap_ci, paired_power, mcnemar, cohen_kappa, kendall_tau
 §8  Judges      MockJudge (simulator w/ injected bias) | HTTPJudge (openai/anthropic)
@@ -100,6 +101,35 @@ Breaking one of these silently invalidates every number downstream.
    (`calibrate_abstain`, `cfg.abstain_fabr`), fitted on a dev split and reported held-out.
    B4 holds out **by proofline**, not by query: the leak is at the record level.
 
+## Real data (arXiv)
+
+`--source arxiv` loads a real corpus instead of generating one, from two cached files
+under `.proofline/data/` that `prepare_arxiv.py` builds. See the README for the fetch
+commands. One card per paper *version*, chained by `supersedes_id`; `proofline_id` is
+the arXiv category; `true_support` is empty because nothing is planted.
+
+Three things that bite:
+
+- **`--source arxiv` is required on every branch run**, not just the seed. Without it
+  `eval_provenance` defaults to `planted`, which real data has none of, and B2/B3/B4
+  evaluate **zero queries**. They now say so instead of returning an empty table.
+- **`--embedder` must match what the corpus was embedded with.** A 256-dim query
+  vector against a 768-dim index raises; two models sharing a dimension would silently
+  produce garbage instead.
+- **B1 loses `planted`.** Link fidelity and rank bias report NOT MEASURABLE rather
+  than printing zeros, because a measurement that was never taken must not look like a
+  result of zero.
+
+Extra scripts, each a PEP 723 script that imports the harness:
+
+```
+prepare_arxiv.py      join the two arXiv sources into the loader's cached inputs
+branch_a_anchor.py    grade label sources by verdict agreement against a judge anchor
+judge_noise_floor.py  same pair twice in the SAME order, to separate a judge's
+                      sampling noise from its position bias
+RESULTS.html          findings from the full four-branch run on 60k arXiv cards
+```
+
 ## Extending
 
 - **New scorer**: subclass `Scorer` in §5, set `name`/`description`/`uses_graph`,
@@ -107,7 +137,11 @@ Breaking one of these silently invalidates every number downstream.
   class to the list literal building `SCORERS`. `--baseline`/`--candidate` choices derive
   from that dict, so nothing else needs touching.
 - **New CLI flag**: `argparse` in `main()` *and* the `Config` field *and* the `Config(...)`
-  construction, three places, all in one screen.
+  construction, three places, all in one screen. Current additions beyond the original
+  set: `--source`, `--eval-provenance`, `--max-eval-queries`, `--scale-judged-budget`.
+- **Judges** are specified `provider` or `provider:model`, so two models from one
+  vendor run as two distinct judges (`anthropic:claude-sonnet-5`). Both provider paths
+  must be asked the *same* question or cross-judge agreement measures the prompt.
 - **Real data instead of synthetic**: fill `cards` and `edges` (`kind` in
   `parent`/`citation`), leave `true_support` empty. Every branch runs except B1's
   label-source comparison, which needs planted truth to grade labels against.
