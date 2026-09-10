@@ -1,14 +1,38 @@
 # proofline-eval
 
-A single-file harness for one question: **two candidate scorers rank pieces of a shared
-record for a query — which is better, before either goes live?**
+**A RAG retrieval-evaluation experiment on a scientific research claims graph.**
+
+A single-file harness for one question: **two candidate retrievers rank pieces of a
+shared research record for a query — which is better, before either goes live?**
 
 That question is easy to answer badly. You need labels nobody wrote, a metric those
 labels actually permit, a scale test that doesn't lie, and a gate that doesn't fire on
 noise. This harness implements all four as runnable experiments, on a synthetic corpus
-with planted ground truth *or* on 60k real arXiv papers.
+with planted ground truth *or* on 60,001 real arXiv papers.
 
-**[Read the results →](RESULTS.html)** — all four branches run against real arXiv data.
+The record under test is a **graph of scientific claims**, not a flat document dump.
+Every card is one versioned claim; edges are the citations its authors actually recorded.
+That shape is the whole point — it is what makes the retrieval problem hard in ways a
+plain corpus is not, and it is where the labels come from:
+
+- **Graph-derived relevance.** The citation edges *are* relevance judgments, made by
+  domain experts with full context. Branch 1 measures how biased and incomplete they are
+  instead of assuming either way — on real data they recover a genuinely partial view.
+- **Versioned claims.** 26,355 of 60,001 cards are superseded revisions of a claim whose
+  current form sits elsewhere in the corpus. Near-identical in meaning, so no embedding
+  separates them; separating them is a metadata problem, and treating it as one converts
+  a ranking trade-off into a guarantee.
+- **Claims move.** Every query carries an `as_of` and is answered against the graph as it
+  stood then, across a 30-year span. A frozen RAG test set does not merely go stale, it
+  goes wrong — it penalises whichever retriever finds the *current* version of a claim.
+- **Circularity is real here.** A retriever that reads graph structure cannot be scored
+  against graph-derived labels. The harness refuses that comparison in code.
+
+Retrievers compared: BM25, dense (SPECTER2, a scientific-document encoder), reciprocal
+rank fusion, RRF plus a supersession filter, and a cross-encoder reranker.
+
+**[Read the results →](RESULTS.html)** — all four branches run against the real arXiv
+claims graph.
 
 ---
 
@@ -74,11 +98,16 @@ DATABASE_URL=            # optional; unset boots a private embedded Postgres
 
 ---
 
-## Real data: arXiv
+## Real data: the arXiv claims graph
 
 The synthetic corpus exists so the harness can grade its *own labels* — you cannot do
 that on real data, which is the point of B1. But everything else runs better on the real
 thing: genuine version chains, genuine citation edges, genuine incompleteness.
+
+Two public sources are joined into one graph of scientific claims: arXiv metadata
+supplies the claims and their revision history, ogbn-arxiv supplies the citation edges
+between them. 60,001 cards over 33,646 papers, 898,609 citation edges, 41 subject areas,
+1995–2025.
 
 Two public sources, no Kaggle account needed. Both are anonymous downloads.
 
