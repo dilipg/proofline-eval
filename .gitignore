@@ -1,0 +1,17 @@
+# Secrets. .env.example is the template and IS tracked.
+.env
+.env.*
+!.env.example
+
+# Local docs, notes and design specs
+docs/
+
+# Harness state: embedded Postgres cluster, JSON reports, and ~5 GB of
+# downloaded corpus. All of it is reproducible from the fetch + seed commands.
+.proofline/
+
+# Python / editor / OS
+__pycache__/
+*.pyc
+.mypy_cache/
+.DS_Store
