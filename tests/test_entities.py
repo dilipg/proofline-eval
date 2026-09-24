@@ -117,3 +117,29 @@ def test_about_half_the_bridges_reuse_an_existing_citation(quick_on):
 
 def test_plant_is_deterministic():
     assert corpus_digest(build("smoke", True)) == corpus_digest(build("smoke", True))
+
+
+def test_enough_revisions_change_a_reported_value(quick_on):
+    # P2's history family needs ~150 methods whose ONE revised reporter changed value
+    by_id = {c.id: c for c in quick_on.cards}
+    succ = {c.supersedes_id: c.id for c in quick_on.cards if c.supersedes_id}
+
+    def chain(root):
+        out, cid = [root], root
+        while cid in succ:
+            cid = succ[cid]
+            out.append(cid)
+        return out
+
+    changed = 0
+    per_method: dict = {}
+    for c in quick_on.cards:
+        if c.supersedes_id is None and c.id in succ:
+            for m in {s for s, r, _o, _v in c.true_facts if r == "reports"}:
+                vals = [v for cid in chain(c.id) for s, r, _o, v in by_id[cid].true_facts
+                        if s == m and r == "reports"]
+                if len(set(vals)) > 1:
+                    per_method[m] = per_method.get(m, 0) + 1
+    changed = sum(1 for n in per_method.values() if n == 1)
+    assert changed >= 150, changed
+    assert quick_on.stats["chain_reporters"] > 0

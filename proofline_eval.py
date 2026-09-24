@@ -342,6 +342,16 @@ _SAY: dict[str, tuple[str, ...]] = {
 }
 
 
+# P2's history and chrono_asof families need results that change across a card's own
+# revisions. Left to chance, a reporter lands on a version chain ~4% of the time, so most
+# methods get one reporter placed on a chain, and that reporter's value changes more often.
+CHAIN_REPORT_P = 0.9
+CHAIN_CHANGE_P = 0.8
+# Methods reported on several datasets feed aggregate_set; single-dataset methods feed
+# every other family (their answers must have one referent). P2 tunes this share.
+MULTI_DATASET_P = 0.3
+
+
 def plant_entities(cards: list[Card], vocab: set[str], seed: int
                    ) -> tuple[list[tuple[str, str, str, Optional[str]]], dict]:
     rng = random.Random(seed + 1)
@@ -362,6 +372,12 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
 
     def later_than(c: Card) -> list[Card]:
         return roots[bisect.bisect_right(root_ts, c.committed_at):]
+
+    chain_roots = [c for c in roots if c.id in succ]
+    chain_ts = [c.committed_at for c in chain_roots]
+
+    def chains_later_than(c: Card) -> list[Card]:
+        return chain_roots[bisect.bisect_right(chain_ts, c.committed_at):]
 
     # time-valid observable links only: a "linked" placement must survive seeding
     cites = {c.id: {d for d in c.parent_ids + c.citation_ids
@@ -488,7 +504,7 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
                 say(v, tpl, [(mid, name, "mentions"), (m2, name_of[m2], "mentions")],
                     (mid, "extends", m2, None), e=name, f=name_of[m2])
 
-        multi = rng.random() < 0.2 and len(dataset_ids) >= 2
+        multi = rng.random() < MULTI_DATASET_P and len(dataset_ids) >= 2
         ds = (rng.sample(dataset_ids, k=rng.randrange(2, min(8, len(dataset_ids)) + 1))
               if multi else [rng.choice(dataset_ids)])
         if multi:
@@ -520,14 +536,21 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
 
         k_more = rng.randrange(0, 4) + (len(ds) if multi else 0)
         reporters = ([intro] if rng.random() < 0.6 else []) + rng.sample(later, k=min(len(later), k_more))
+        taken = {r.id for r in reporters}
+        on_chain = [r for r in chains_later_than(intro) if r.id not in taken]
+        chain_rep = rng.choice(on_chain) if on_chain and rng.random() < CHAIN_REPORT_P else None
+        if chain_rep is not None:
+            reporters.append(chain_rep)
+            stats["chain_reporters"] += 1
         for j, r in enumerate(uniq(reporters)):
             d = ds[j % len(ds)]
             x = metric_of[d]
             surface = name if r is intro or not aliases or rng.random() >= 0.3 else rng.choice(aliases)
             tpl = rng.choice(_SAY["reports"])
             value = new_value()
+            change_p = CHAIN_CHANGE_P if r is chain_rep else 0.5
             for k, v in enumerate(versions(r)):
-                if k and rng.random() < 0.5:
+                if k and rng.random() < change_p:
                     value = new_value(value)
                     stats["value_changes"] += 1
                 say(v, tpl, [(mid, surface, "mentions"), (d, name_of[d], "mentions"),
