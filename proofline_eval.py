@@ -2616,6 +2616,202 @@ def build_usage_mined(store: Store, cfg: Config, embedder: Embedder,
     return len(rows_q)
 
 
+def _norm_surface(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def _norm_class(s: Optional[str]) -> str:
+    return re.sub(r"[^a-z]+", "", (s or "").lower())
+
+
+def _norm_value(v: Optional[str]) -> Optional[str]:
+    m = re.search(r"\d*\.\d+|\d+", str(v)) if v is not None else None
+    return f"{float(m.group(0)):.2f}" if m else None
+
+
+def _snake(pred: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", pred.strip()).lower().replace(" ", "_")
+
+
+def _ratio(a: float, b: float) -> float:
+    return a / b if b else float("nan")
+
+
+def _strongest(a: str, b: str) -> str:
+    return min(a, b, key=lambda r: MENTION_ROLES.index(r) if r in MENTION_ROLES else 99)
+
+
+def extraction_fidelity(truth: dict, ext: dict) -> dict:
+    """Grade one extractor against the planted entity layer, on the cards it actually read.
+
+    Extracted entities carry their own ids, so they are aligned to planted ones through
+    surface forms. A mention whose surface nothing planted (the LLM turning "a sampling
+    method" into an entity) is a false positive; an extracted entity whose mentions align
+    to two planted ones is a false merge; a planted entity whose aliases landed on two
+    extracted ids is an unresolved alias."""
+    cards = ext["cards"]
+    t_ent = truth["entities"]
+    t_pairs: dict[tuple[str, str], str] = {}
+    for c, e, _s, r in truth["mentions"]:
+        if c in cards:
+            t_pairs[(c, e)] = _strongest(t_pairs.get((c, e), r), r)
+    t_fac = {(c, s, r, o, _norm_value(v) if r == "reports" else None)
+             for c, s, r, o, v in truth["facts"] if c in cards}
+    surf2t: dict[str, str] = {}
+    for eid, (name, _k, _p) in sorted(t_ent.items()):
+        surf2t.setdefault(_norm_surface(name), eid)
+    for _c, eid, surface, _r in sorted(truth["mentions"]):
+        surf2t.setdefault(_norm_surface(surface), eid)
+
+    x_pairs: dict[tuple[str, str], str] = {}
+    votes: dict[str, Counter] = defaultdict(Counter)
+    surf_by_t: dict[str, set] = defaultdict(set)
+    xs_by_t: dict[str, set] = defaultdict(set)
+    for c, xid, surface, role in sorted(ext["mentions"]):
+        ns = _norm_surface(surface)
+        tid = surf2t.get(ns)
+        key = (c, tid) if tid else (c, f"?{xid}:{ns}")
+        x_pairs[key] = _strongest(x_pairs.get(key, role), role)
+        if tid:
+            votes[xid][tid] += 1
+            surf_by_t[tid].add(ns)
+            xs_by_t[tid].add(xid)
+    hit = set(t_pairs) & set(x_pairs)
+    x2t = {x: v.most_common(1)[0][0] for x, v in votes.items()}
+
+    t2x: dict[str, Counter] = defaultdict(Counter)
+    for x, v in votes.items():
+        for t, n in v.items():
+            t2x[t][x] += n
+    type_scores = []
+    for tid, xs in t2x.items():
+        if tid in t_ent:
+            _n, leaf, parent = t_ent[tid]
+            kind = _norm_class(ext["entities"].get(xs.most_common(1)[0][0], ("", ""))[1])
+            type_scores.append(1.0 if kind == _norm_class(leaf)
+                               else 0.5 if parent and kind == _norm_class(parent) else 0.0)
+    eligible = [t for t, ss in surf_by_t.items() if len(ss) > 1]
+
+    def onto_class(k: str) -> Optional[str]:
+        return next((c for c in ONTO_CLASSES if _norm_class(c) == _norm_class(k)), None)
+
+    kind_of = {x: onto_class(k) for x, (_n, k) in ext["entities"].items()}
+    x_fac: set = set()
+    untyped = violations = 0
+    for c, s, r, o, v in ext["facts"]:
+        rel = _snake(r)
+        if rel not in ONTO_RELATIONS:
+            untyped += 1
+            continue
+        x_fac.add((c, x2t.get(s, f"?{s}"), rel, x2t.get(o, f"?{o}"),
+                   _norm_value(v) if rel == "reports" else None))
+        dom, rng_ = ONTO_RELATIONS[rel]
+        ks, ko = kind_of.get(s), kind_of.get(o)
+        if not ks or not ko or top_class(ks) not in dom or top_class(ko) not in rng_:
+            violations += 1
+    f_hit = t_fac & x_fac
+
+    x_classes = {_norm_class(c) for c, _p in ext["classes"]}
+    x_edges = {(_norm_class(c), _norm_class(p)) for c, p in ext["classes"] if p}
+    planted_edges = {(_norm_class(c), _norm_class(p)) for c, p in ONTO_CLASSES.items() if p}
+
+    methods = {e for e, (_n, k, _p) in t_ent.items() if top_class(k) == "Method"}
+    users: dict[str, set] = defaultdict(set)
+    definers: dict[str, set] = defaultdict(set)
+    for (c, e), r in t_pairs.items():
+        if e in methods and r == "uses":
+            users[e].add(c)
+        if e in methods and r == "introduces":
+            definers[e].add(c)
+    for c, s, r, _o, _v in t_fac:
+        if r == "reports" and s in methods:
+            definers[s].add(c)
+    pairs = [(u, d, e) for e in methods for u in users[e] for d in definers[e] if u != d]
+    covered = sum(1 for u, d, e in pairs if (u, e) in hit and (d, e) in hit)
+    return dict(
+        mention_precision=_ratio(len(hit), len(x_pairs)),
+        mention_recall=_ratio(len(hit), len(t_pairs)),
+        role_accuracy=_ratio(sum(1 for p in hit if x_pairs[p] == t_pairs[p]), len(hit)),
+        type_accuracy=statistics.fmean(type_scores) if type_scores else float("nan"),
+        alias_resolution=_ratio(sum(1 for t in eligible if len(xs_by_t[t]) == 1), len(eligible)),
+        false_merges=sum(1 for v in votes.values() if len(v) > 1),
+        fact_precision=_ratio(len(f_hit), len(x_fac)), fact_recall=_ratio(len(f_hit), len(t_fac)),
+        untyped_links=untyped, domain_range_violations=violations,
+        class_recall=len({_norm_class(c) for c in ONTO_CLASSES} & x_classes) / len(ONTO_CLASSES),
+        subclass_edge_recall=len(planted_edges & x_edges) / len(planted_edges),
+        bridge_coverage=_ratio(covered, len(pairs)), bridges=len(pairs))
+
+
+def grade_source(truth: dict, ext: dict) -> dict:
+    counts = dict(cards=len(ext["cards"]), entities=len(ext["entities"]),
+                  mentions=len(ext["mentions"]), facts=len(ext["facts"]))
+    if not truth["entities"]:
+        return dict(measured=False, **counts)
+    return dict(measured=True, **counts, **extraction_fidelity(truth, ext))
+
+
+_FIDELITY_ROWS = [
+    ("mention_precision", "mention precision"), ("mention_recall", "mention recall"),
+    ("type_accuracy", "type accuracy (parent class scores 0.5)"),
+    ("alias_resolution", "alias resolution"), ("false_merges", "false merges (count)"),
+    ("fact_precision", "typed fact precision"), ("fact_recall", "typed fact recall"),
+    ("untyped_links", "untyped links (count)"),
+    ("domain_range_violations", "domain/range violations (count)"),
+    ("class_recall", "ontology class recall"), ("subclass_edge_recall", "subclass edge recall"),
+    ("bridge_coverage", "bridge coverage (both ends extracted)"),
+    ("role_accuracy", "role accuracy (cue phrases: template-tuned)"),
+]
+
+
+def _cell(v: Any) -> str:
+    if v is None:
+        return "-"
+    if isinstance(v, float):
+        return "n/a" if math.isnan(v) else f"{v:.3f}"
+    return str(v)
+
+
+def extraction_block(store: Store) -> Optional[dict]:
+    """B1's grade of every extractor that has written to this corpus. Printed and returned."""
+    with store.conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT source FROM extracted_cards ORDER BY source")
+        sources = [r["source"] for r in cur.fetchall()]
+        if not sources:
+            log("\n  extraction fidelity: NOT INGESTED. Run `uv run ingest_semantica.py "
+                "--method regex` (or --method llm) after seeding; `all` re-seeds and empties it.")
+            return None
+        cur.execute("SELECT id, name, kind, parent_kind FROM true_entities")
+        truth = dict(entities={r["id"]: (r["name"], r["kind"], r["parent_kind"]) for r in cur.fetchall()})
+        cur.execute("SELECT card_id, entity_id, surface, role FROM true_mentions")
+        truth["mentions"] = [tuple(r.values()) for r in cur.fetchall()]
+        cur.execute("SELECT card_id, subj, rel, obj, value FROM true_facts")
+        truth["facts"] = [tuple(r.values()) for r in cur.fetchall()]
+        out: dict[str, dict] = {}
+        for src in sources:
+            cur.execute("SELECT card_id FROM extracted_cards WHERE source = %s", (src,))
+            ext = dict(cards={r["card_id"] for r in cur.fetchall()})
+            cur.execute("SELECT id, name, kind FROM entities WHERE source = %s", (src,))
+            ext["entities"] = {r["id"]: (r["name"], r["kind"]) for r in cur.fetchall()}
+            cur.execute("SELECT card_id, entity_id, surface, role FROM mentions WHERE source = %s", (src,))
+            ext["mentions"] = [tuple(r.values()) for r in cur.fetchall()]
+            cur.execute("SELECT card_id, subj, rel, obj, value FROM facts WHERE source = %s", (src,))
+            ext["facts"] = [tuple(r.values()) for r in cur.fetchall()]
+            cur.execute("SELECT class, parent FROM onto_classes WHERE source = %s", (src,))
+            ext["classes"] = [(r["class"], r["parent"]) for r in cur.fetchall()]
+            out[src] = grade_source(truth, ext)
+    log("\n  extraction fidelity against the planted entity layer (on the cards each extractor read):")
+    log("    " + f"{'':<46}" + "".join(f"{s[-26:]:>28}" for s in sources))
+    rows = [("cards", "cards read"), ("entities", "entities"), ("mentions", "mentions"),
+            ("facts", "facts")]
+    if any(out[s]["measured"] for s in sources):
+        rows += _FIDELITY_ROWS
+    else:
+        log("    NOT MEASURABLE: this corpus has no planted entities (real data); counts only.")
+    for key, label in rows:
+        log("    " + f"{label:<46}" + "".join(f"{_cell(out[s].get(key)):>28}" for s in sources))
+    return out
+
+
 def branch1_labels(store: Store, cfg: Config, embedder: Embedder,
                    tracer: Tracer) -> dict:
     """B1: Gold from nowhere.
@@ -2719,6 +2915,7 @@ def branch1_labels(store: Store, cfg: Config, embedder: Embedder,
         log(f"    a link they did NOT record is in it {bu:.1%} of the time")
         log(f"    -> mined labels favour the incumbent by {br/bu if bu else float('inf'):.2f}x")
 
+    out["extraction"] = extraction_block(store)
     log(f"\n  verdict agreement: truth says {truth_verdict}; " +
         ", ".join(f"{k}={v.get('verdict','-')}" for k, v in out["sources"].items()
                   if k != "planted" and "verdict" in v))
