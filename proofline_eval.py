@@ -62,6 +62,7 @@ Tracing is Langfuse (optional). Set LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY.
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import json
 import math
@@ -71,9 +72,10 @@ import re
 import statistics
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field, asdict
+from itertools import cycle
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -136,6 +138,7 @@ class Config:
     max_eval_queries: int = 1500            # cap per provenance, for tractability
     scale_judged_budget: int = 2000         # see branch3_scale: pinned-document budget
     abstain_fabr: float = 0.10             # matched false-abstention rate for calibration
+    entities: bool = True                  # plant the typed entity layer (synthetic only)
     baseline: str = "bm25"
     candidate: str = "hybrid_rrf"
     database_url: Optional[str] = None
@@ -226,6 +229,8 @@ class Card:
     terms: list[str]
     inherited_terms: list[str]      # PLANTED: the words that came from its support
     findability: float              # PLANTED: how easy this card is to stumble on
+    true_mentions: list = field(default_factory=list)  # PLANTED: (entity_id, surface, role)
+    true_facts: list = field(default_factory=list)     # PLANTED: (subj, rel, obj, value)
 
     @property
     def text(self) -> str:
@@ -252,6 +257,7 @@ class Corpus:
     held_out_prooflines: set[str]
     topics: dict[int, list[str]]
     stats: dict[str, Any]
+    entities: list = field(default_factory=list)       # PLANTED: (id, name, kind, parent_kind)
 
 
 def _paraphrase(terms: Sequence[str], rng: random.Random) -> list[str]:
@@ -270,6 +276,299 @@ def _paraphrase(terms: Sequence[str], rng: random.Random) -> list[str]:
         else:
             out.append(t[::-1][:6])              # a synonym: same concept, no overlap
     return out
+
+
+# ---- planted entity layer ---------------------------------------------------------
+#
+# Typed entities and the relations between them, rendered into card text so an
+# extractor has something real to find, and recorded as truth so B1 can grade whatever
+# it found. The ontology DESIGN (classes, relations, roles) is shared with
+# ingest_semantica.py. The INSTANCES are truth, and live only in Card.true_* and the
+# planted tables.
+#
+# It runs after the queries are built and draws from its own random stream, so
+# --no-entities reproduces the corpus byte for byte. No edge is ever added: a "linked"
+# placement reuses a citation that already exists.
+# ----------------------------------------------------------------------------------
+
+ONTO_CLASSES: dict[str, Optional[str]] = {
+    "Method": None, "VariationalMethod": "Method", "KernelMethod": "Method",
+    "SamplingMethod": "Method", "Dataset": None, "Benchmark": "Dataset",
+    "Corpus": "Dataset", "Metric": None, "Material": None, "Organism": None,
+}
+# entity -> entity relations; domain and range are TOP-LEVEL classes
+ONTO_RELATIONS: dict[str, tuple[frozenset, frozenset]] = {
+    "extends": (frozenset({"Method"}), frozenset({"Method"})),
+    "evaluated_on": (frozenset({"Method"}), frozenset({"Dataset"})),
+    "measured_by": (frozenset({"Dataset"}), frozenset({"Metric"})),
+    "reports": (frozenset({"Method"}), frozenset({"Dataset"})),
+}
+# card -> entity roles, strongest first
+MENTION_ROLES = ("introduces", "uses", "studies", "mentions")
+
+
+def top_class(kind: str) -> str:
+    while ONTO_CLASSES.get(kind):
+        kind = ONTO_CLASSES[kind]
+    return kind
+
+
+_ENT_A = ["kav", "orv", "dor", "pel", "tril", "zan", "quor", "vesp", "hal", "mir",
+          "tob", "xen", "lum", "brak", "cyr", "fen", "gol", "nim", "sav", "ulm"]
+_ENT_B = ["rel", "ane", "vin", "lia", "on", "dex", "ith", "ar", "ova", "us",
+          "en", "ix", "ost", "ula", "ep"]
+_KIND_WORD = {"VariationalMethod": "variational", "KernelMethod": "kernel",
+              "SamplingMethod": "sampling", "Benchmark": "benchmark", "Corpus": "corpus"}
+_DATASET_SUFFIX = {"Benchmark": ("QA", "Bench"), "Corpus": ("Corpus", "Text")}
+_MATERIAL_SUFFIX = ("oxide", "nitride", "alloy", "polymer")
+# At least three phrasings per relation, so no extractor wins on a single template.
+_SAY: dict[str, tuple[str, ...]] = {
+    "intro_method": ("we introduce {e} , a {k} method", "{e} is a {k} method proposed in this note",
+                     "this note presents {e} , a {k} approach"),
+    "intro_dataset": ("we release {e} , a new {k}", "{e} is a {k} assembled for this study",
+                      "the {k} {e} is introduced here"),
+    "intro_material": ("we synthesise {e} for the first time", "{e} is a new material prepared here",
+                       "this work reports the preparation of {e}"),
+    "measured_by": ("{d} is scored with {x}", "performance on {d} is measured in {x}",
+                    "{d} reports results as {x}"),
+    "uses": ("we adopt {e} here", "our pipeline builds on {e}", "the analysis relies on {e}"),
+    "studies": ("experiments use {e} as the model organism", "we study {e}",
+                "samples of {e} were examined"),
+    "reports": ("{e} reaches {v} {x} on {d}", "on {d} , {e} scores {v} {x}",
+                "we measure {v} {x} for {e} on {d}"),
+    "extends": ("{e} extends {f}", "{e} builds directly on {f}", "{e} is a refinement of {f}"),
+    "evaluated_on": ("{e} is evaluated on {d}", "we test {e} on {d}",
+                     "{d} serves as the testbed for {e}"),
+}
+
+
+def plant_entities(cards: list[Card], vocab: set[str], seed: int
+                   ) -> tuple[list[tuple[str, str, str, Optional[str]]], dict]:
+    rng = random.Random(seed + 1)
+    by_id = {c.id: c for c in cards}
+    succ = {c.supersedes_id: c.id for c in cards if c.supersedes_id}
+
+    def versions(root: Card) -> list[Card]:
+        out, cid = [root], root.id
+        while cid in succ:
+            cid = succ[cid]
+            out.append(by_id[cid])
+        return out
+
+    roots = sorted((c for c in cards if c.supersedes_id is None),
+                   key=lambda c: (c.committed_at, c.id))
+    root_ts = [c.committed_at for c in roots]
+    nonseed = [c for c in roots if c.kc_type != "seed"] or roots
+
+    def later_than(c: Card) -> list[Card]:
+        return roots[bisect.bisect_right(root_ts, c.committed_at):]
+
+    # time-valid observable links only: a "linked" placement must survive seeding
+    cites = {c.id: {d for d in c.parent_ids + c.citation_ids
+                    if by_id[d].committed_at <= c.committed_at} for c in cards}
+    nbrs: dict[str, set[str]] = defaultdict(set)
+    for s, ds in cites.items():
+        for d in ds:
+            nbrs[s].add(d)
+            nbrs[d].add(s)
+    # roots that some later root cites: the only introducers a linked bridge can use
+    root_ids = {r.id for r in roots}
+    cited = {d for r in roots for d in cites[r.id]
+             if d in root_ids and by_id[d].committed_at < r.committed_at}
+
+    stems = [a + b for a in _ENT_A for b in _ENT_B]
+    rng.shuffle(stems)
+    assert not set(stems) & vocab, "entity stems collide with topic vocabulary"
+    pool = dict(method=stems[0:60], benchmark=stems[60:135], corpus=stems[135:210],
+                material=stems[210:250], genus=stems[250:270], species=stems[270:290],
+                metric=stems[290:294])
+    n = len(cards)
+    counts = dict(method=max(12, n // 10), dataset=max(6, n // 40),
+                  material=max(4, n // 80), organism=max(4, n // 80))
+
+    ents: list[tuple[str, str, str, Optional[str]]] = []
+    name_of: dict[str, str] = {}
+    said: dict[str, list[str]] = defaultdict(list)
+    ment: dict[str, dict[str, tuple[set, str]]] = defaultdict(dict)
+    facts: dict[str, list[tuple]] = defaultdict(list)
+    stats = Counter()
+
+    def new_entity(prefix: str, name: str, kind: str) -> str:
+        eid = f"ent_{prefix}_{len(ents):05d}"
+        ents.append((eid, name, kind, ONTO_CLASSES[kind]))
+        name_of[eid] = name
+        return eid
+
+    def say(card: Card, template: str, mentions: list[tuple[str, str, str]],
+            fact: Optional[tuple] = None, **slots: str) -> None:
+        said[card.id] += template.format(**slots).split() + ["."]
+        for eid, surface, role in mentions:
+            surfs, prev = ment[card.id].get(eid, (set(), "mentions"))
+            surfs.add(surface)
+            ment[card.id][eid] = (surfs, min(prev, role, key=MENTION_ROLES.index))
+        if fact:
+            facts[card.id].append(fact)
+
+    def new_value(old: Optional[str] = None) -> str:
+        while True:
+            v = f"0.{rng.randrange(40, 99)}"
+            if v != old:
+                return v
+
+    def uniq(cs: list[Card]) -> list[Card]:
+        # Card is an unhashable dataclass: dedupe by id, keeping first-seen order
+        return list({c.id: c for c in cs}.values())
+
+    def dataset_names(kind: str):
+        # a function, not a comprehension: a generator built in a dict comprehension
+        # would read `kind` late and give every class the last class's suffixes
+        r = 0
+        while True:
+            for s in pool[kind.lower()]:
+                for suf in _DATASET_SUFFIX[kind]:
+                    yield f"{s.title()}-{suf}{r + 1 if r else ''}"
+            r += 1
+
+    # metrics, then datasets (each introduced once, scored with one metric)
+    metric_ids = [new_entity("x", f"{s}-score", "Metric") for s in pool["metric"]]
+    names = {k: dataset_names(k) for k in _DATASET_SUFFIX}
+    dataset_ids, metric_of = [], {}
+    for i in range(counts["dataset"]):
+        kind = ("Benchmark", "Corpus")[i % 2]
+        did = new_entity("d", next(names[kind]), kind)
+        dataset_ids.append(did)
+        metric_of[did] = rng.choice(metric_ids)
+        intro = rng.choice(nonseed)
+        t_i, t_m = rng.choice(_SAY["intro_dataset"]), rng.choice(_SAY["measured_by"])
+        x = metric_of[did]
+        for v in versions(intro):
+            say(v, t_i, [(did, name_of[did], "introduces")], e=name_of[did], k=_KIND_WORD[kind])
+            say(v, t_m, [(did, name_of[did], "mentions"), (x, name_of[x], "mentions")],
+                (did, "measured_by", x, None), d=name_of[did], x=name_of[x])
+
+    # methods: introduced once, used later (the bridges), reported on over time
+    fresh = cycle(pool["method"])
+    stem_of, intro_of, used_names = {}, {}, set()
+    for i in range(counts["method"]):
+        sibling = rng.choice(list(stem_of)) if stem_of and rng.random() < 0.2 else None
+        stem = stem_of[sibling] if sibling else next(fresh)
+        while True:
+            num = rng.randrange(2, 100)
+            name = f"{stem.title()}-{num}"
+            if name not in used_names:
+                used_names.add(name)
+                break
+        kind = rng.choice(("VariationalMethod", "KernelMethod", "SamplingMethod"))
+        mid = new_entity("m", name, kind)
+        stem_of[mid] = stem
+        avoid = intro_of[sibling].topic if sibling else None
+        # decide linked vs unlinked BEFORE choosing the introducer: a linked bridge needs
+        # an introducer somebody later cites, and most cards are cited by nobody
+        want_linked = rng.random() < 0.5
+        cands = [r for r in nonseed if avoid is None or r.topic != avoid] or nonseed
+        linkable = [r for r in cands if r.id in cited] if want_linked else []
+        intro = rng.choice(linkable or cands)
+        intro_of[mid] = intro
+        if sibling or sum(1 for s in stem_of.values() if s == stem) > 1:
+            stats["near_miss_methods"] += 1
+        # an alias belongs to one method only: 'KA-7' must not name two things
+        aliases = ([s for s in (f"{stem.title()} {num}", f"{stem[:2].upper()}-{num}")
+                    if s not in used_names] if rng.random() < 0.3 else [])
+        used_names.update(aliases)
+        stats["aliased_methods"] += bool(aliases)
+        tpl = rng.choice(_SAY["intro_method"])
+        for v in versions(intro):
+            say(v, tpl, [(mid, name, "introduces")], e=name, k=_KIND_WORD[kind])
+
+        older = [m for m in intro_of if m != mid and intro_of[m].committed_at < intro.committed_at]
+        if older and rng.random() < 0.3:
+            m2 = rng.choice(older)
+            tpl = rng.choice(_SAY["extends"])
+            for v in versions(intro):
+                say(v, tpl, [(mid, name, "mentions"), (m2, name_of[m2], "mentions")],
+                    (mid, "extends", m2, None), e=name, f=name_of[m2])
+
+        multi = rng.random() < 0.2 and len(dataset_ids) >= 2
+        ds = (rng.sample(dataset_ids, k=rng.randrange(2, min(8, len(dataset_ids)) + 1))
+              if multi else [rng.choice(dataset_ids)])
+        if multi:
+            for d in ds:
+                tpl = rng.choice(_SAY["evaluated_on"])
+                for v in versions(intro):
+                    say(v, tpl, [(mid, name, "mentions"), (d, name_of[d], "mentions")],
+                        (mid, "evaluated_on", d, None), e=name, d=name_of[d])
+
+        later = later_than(intro)
+        if not later:
+            continue
+        a_card = None
+        if want_linked:
+            linked = [r for r in later if intro.id in cites[r.id]]
+            a_card = rng.choice(linked) if linked else None
+        if a_card is None:
+            far = nbrs[intro.id]
+            unlinked = [r for r in later if r.proofline_id != intro.proofline_id
+                        and intro.id not in nbrs[r.id] and not (nbrs[r.id] & far)]
+            a_card = rng.choice(unlinked or later)
+        stats["bridges_linked" if intro.id in cites[a_card.id] else "bridges_unlinked"] += 1
+        users = uniq([a_card] + rng.sample(later, k=min(len(later), rng.randrange(0, 4))))
+        for u in users:
+            surface = rng.choice(aliases) if aliases and rng.random() < 0.5 else name
+            tpl = rng.choice(_SAY["uses"])
+            for v in versions(u):
+                say(v, tpl, [(mid, surface, "uses")], e=surface)
+
+        k_more = rng.randrange(0, 4) + (len(ds) if multi else 0)
+        reporters = ([intro] if rng.random() < 0.6 else []) + rng.sample(later, k=min(len(later), k_more))
+        for j, r in enumerate(uniq(reporters)):
+            d = ds[j % len(ds)]
+            x = metric_of[d]
+            surface = name if r is intro or not aliases or rng.random() >= 0.3 else rng.choice(aliases)
+            tpl = rng.choice(_SAY["reports"])
+            value = new_value()
+            for k, v in enumerate(versions(r)):
+                if k and rng.random() < 0.5:
+                    value = new_value(value)
+                    stats["value_changes"] += 1
+                say(v, tpl, [(mid, surface, "mentions"), (d, name_of[d], "mentions"),
+                             (x, name_of[x], "mentions")],
+                    (mid, "reports", d, value), e=surface, v=value, x=name_of[x], d=name_of[d])
+                facts[v.id].append((mid, "evaluated_on", d, None))
+
+    for i in range(counts["material"]):
+        name = f"{pool['material'][i % 40]} {_MATERIAL_SUFFIX[(i // 40) % 4]}"
+        mat = new_entity("mat", name, "Material")
+        intro = rng.choice(nonseed)
+        tpl = rng.choice(_SAY["intro_material"])
+        for v in versions(intro):
+            say(v, tpl, [(mat, name, "introduces")], e=name)
+        later = later_than(intro)
+        for u in rng.sample(later, k=min(len(later), rng.randrange(1, 4))):
+            tpl = rng.choice(_SAY["uses"])
+            for v in versions(u):
+                say(v, tpl, [(mat, name, "uses")], e=name)
+
+    for i in range(counts["organism"]):
+        name = f"{pool['genus'][i % 20].title()} {pool['species'][(i // 20) % 20]}ii"
+        org = new_entity("o", name, "Organism")
+        for c in rng.sample(roots, k=min(len(roots), rng.randrange(2, 6))):
+            tpl = rng.choice(_SAY["studies"])
+            for v in versions(c):
+                say(v, tpl, [(org, name, "studies")], e=name)
+
+    n_tmpl = len(CONNECTIVE)
+    for cid, words in said.items():
+        c = by_id[cid]
+        body = c.body.split()
+        c.body = " ".join(body[:n_tmpl] + words + body[n_tmpl:])
+        c.true_mentions = sorted((eid, s, role) for eid, (surfs, role) in ment[cid].items()
+                                 for s in surfs)
+        c.true_facts = sorted(set(facts[cid]), key=repr)
+    out = dict(stats)
+    out["entities"] = dict(Counter(k for _i, _n, k, _p in ents))
+    out["true_mentions"] = sum(len(c.true_mentions) for c in cards)
+    out["true_facts"] = sum(len(c.true_facts) for c in cards)
+    return ents, out
 
 
 def build_corpus(cfg: Config, n_cards: int, n_prooflines: int) -> Corpus:
@@ -519,6 +818,8 @@ def build_corpus(cfg: Config, n_cards: int, n_prooflines: int) -> Corpus:
                   answerable=False)
         queries["planted"].append(q)
 
+    entities, ent_stats = (plant_entities(cards, {w for ws in topics.values() for w in ws},
+                                          cfg.seed) if cfg.entities else ([], {}))
     stats = {
         "cards": len(cards),
         "current_cards": sum(1 for c in cards if c.is_current),
@@ -538,8 +839,10 @@ def build_corpus(cfg: Config, n_cards: int, n_prooflines: int) -> Corpus:
                 for c in cards)
             / max(1, sum(len(set(c.parent_ids) | set(c.citation_ids)) for c in cards)), 3),
     }
+    stats.update(ent_stats)
     return Corpus(cards=cards, by_id=by_id, queries=dict(queries),
-                  held_out_prooflines=held_out, topics=topics, stats=stats)
+                  held_out_prooflines=held_out, topics=topics, stats=stats,
+                  entities=entities)
 
 
 # ----------------------------------------------------------------------------------
@@ -2867,6 +3170,8 @@ scorers: """ + ", ".join(SCORERS) + """
                     help="smallest nDCG delta worth shipping; drives the power numbers")
     ap.add_argument("--database-url", default=None)
     ap.add_argument("--no-langfuse", action="store_true")
+    ap.add_argument("--no-entities", action="store_true",
+                    help="skip the planted entity layer: reproduces the pre-P1 synthetic corpus")
     ap.add_argument("--fresh", action="store_true",
                     help="re-seed and re-ingest before running")
     a = ap.parse_args(argv)
@@ -2884,7 +3189,7 @@ scorers: """ + ", ".join(SCORERS) + """
                  scale_judged_budget=a.scale_judged_budget,
                  target_effect=a.target_effect, baseline=a.baseline,
                  candidate=a.candidate, database_url=a.database_url,
-                 langfuse=not a.no_langfuse)
+                 langfuse=not a.no_langfuse, entities=not a.no_entities)
 
     if a.cmd == "scorers":
         rule("SCORERS")
