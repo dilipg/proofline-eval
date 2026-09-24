@@ -106,8 +106,8 @@ thing: genuine version chains, genuine citation edges, genuine incompleteness.
 
 Two public sources are joined into one graph of scientific claims: arXiv metadata
 supplies the claims and their revision history, ogbn-arxiv supplies the citation edges
-between them. 60,001 cards over 33,646 papers, 898,609 citation edges, 41 subject areas,
-1995–2025.
+between them. 60,000 cards over 33,696 papers, 879,743 citation edges, 41 subject areas,
+1995–2025. The sample is reproducible: the same data and `--seed` draw the same corpus.
 
 Two public sources, no Kaggle account needed. Both are anonymous downloads.
 

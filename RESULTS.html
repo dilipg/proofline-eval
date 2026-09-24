@@ -114,13 +114,63 @@ strong{font-weight:600}
 <div class="wrap">
 
 <header class="col" style="padding-bottom:8px">
-  <div class="eyebrow">Retrieval evaluation &middot; 10 September 2026</div>
+  <div class="eyebrow">Retrieval evaluation &middot; 10 September 2026 &middot; revised 25 September 2026</div>
   <h1>Four Branches on arXiv</h1>
   <p class="lede">The scorer-evaluation brief was written against a synthetic corpus
   with planted ground truth. This is what happens when all four of its branches are
-  run against 60,001 real arXiv cards instead: where nothing is planted, the
-  citation graph is genuinely incomplete, and half the record is superseded.</p>
+  run against 60,000 real arXiv cards instead: where nothing is planted, the
+  citation graph is genuinely incomplete, and nearly half the record is superseded.</p>
 </header>
+
+<section>
+  <h2>What this revision changed</h2>
+  <div class="stamp">Making the harness answer every query as of its own date moved one
+  conclusion: the cross-encoder, not the metadata filter, is the largest single
+  retrieval win. The first version's filter was reading the future.</div>
+
+  <ul>
+    <li><strong>Supersession is now judged as of the query's date.</strong>
+    <code>hybrid_rrf_fresh</code> and <code>rerank</code> used to drop every card that
+    had been superseded <em>by the end of the record</em>. A query dated 2012 therefore
+    lost every paper revised in 2015, which is knowledge nobody had in 2012, and it
+    correlates with not being cited: the old rule removed 11% of each query's candidates
+    but only 5.1% of its relevant ones. Filtering by what was current on the query's date
+    makes every relevant version reachable (100%, up from 94.9%) and costs
+    <code>hybrid_rrf_fresh</code> 0.006 nDCG@10 (95% CI 0.004 to 0.008) against the old
+    rule, paired on the same queries and labels.</li>
+    <li><strong>A citation points at the version that existed when it was made.</strong>
+    9,665 citations (1.1%) resolved to a version written <em>after</em> the citing
+    paper; they are now dropped rather than pointed at the future.</li>
+    <li><strong>The sample is reproducible.</strong> The snowball sampler walked sets of
+    arXiv ids, whose order Python salts per process, so the same data and seed drew a
+    different corpus every run. The first version's figures were one such draw. Every
+    figure below is from one fixed sample, and each fix was measured on it twice,
+    with the code before and after, so what the fixes moved is separable from what the
+    sample moved.</li>
+  </ul>
+
+  <div class="tw"><table>
+    <caption>Same 60,000-card sample, code before and after the as-of fixes. The published column is the first version's draw.</caption>
+    <thead><tr><th>Figure</th><th class="n">Published</th><th class="n">Before fixes</th>
+      <th class="n">After fixes</th><th>Moved by</th></tr></thead>
+    <tbody>
+      <tr><td class="name">A &middot; dag_mined &minus; usage_mined gap</td><td class="n">0.218</td>
+        <td class="n">0.308</td><td class="n">0.299</td><td>the sample</td></tr>
+      <tr><td class="name">D &middot; hybrid_rrf_fresh &Delta;</td><td class="n">+0.027</td>
+        <td class="n">+0.028</td><td class="n">+0.022</td><td>the as-of fix</td></tr>
+      <tr><td class="name">D &middot; rerank &Delta;</td><td class="n">+0.039</td>
+        <td class="n">+0.039</td><td class="n">+0.038</td><td>neither</td></tr>
+      <tr><td class="name">D &middot; rerank decision</td><td class="n">SHIP</td>
+        <td class="n">BLOCK</td><td class="n">BLOCK</td><td>the sample</td></tr>
+      <tr class="hi"><td class="name">largest single step</td><td class="n">filter</td>
+        <td class="n">filter</td><td class="n">cross-encoder</td><td>the as-of fix</td></tr>
+    </tbody>
+  </table></div>
+
+  <p class="col">Branch B and the judge anchors in Branch A were not re-run: they cost
+  money, and they were measured on the first version's sample. Their figures below are
+  from 10 September and are marked as such.</p>
+</section>
 
 <section>
   <h2>What was measured</h2>
@@ -131,9 +181,9 @@ strong{font-weight:600}
   <code>supersedes_id</code>, so supersession is real rather than synthesised.</p>
 
   <dl class="facts">
-    <div class="fact"><dt>Cards</dt><dd>60,001</dd></div>
-    <div class="fact"><dt>Superseded</dt><dd>26,355</dd></div>
-    <div class="fact"><dt>Citation edges</dt><dd>898,609</dd></div>
+    <div class="fact"><dt>Cards</dt><dd>60,000</dd></div>
+    <div class="fact"><dt>Superseded</dt><dd>26,304</dd></div>
+    <div class="fact"><dt>Citation edges</dt><dd>879,743</dd></div>
     <div class="fact"><dt>Categories</dt><dd>41</dd></div>
     <div class="fact"><dt>Span</dt><dd>1995&ndash;2025</dd></div>
     <div class="fact"><dt>Longest chain</dt><dd>24 versions</dd></div>
@@ -157,37 +207,41 @@ strong{font-weight:600}
   at all, which is what makes it independent of the sources it grades.</p>
 
   <div class="tw"><table>
-    <caption>bm25 vs hybrid_rrf_fresh. Anchors judged 120 queries, order-swapped, zero errors.</caption>
+    <caption>bm25 vs hybrid_rrf_fresh. Anchors judged 120 queries, order-swapped, zero errors, on the 10 September sample; not re-run.</caption>
     <thead><tr><th>Source</th><th class="n">n</th><th class="n">&Delta; nDCG@10</th>
       <th class="n">95% CI</th><th>Verdict</th><th>vs anchor</th></tr></thead>
     <tbody>
-      <tr class="hi"><td class="name">dag_mined</td><td class="n">1,483</td><td class="n">+0.032</td>
-        <td class="n">[+0.028, +0.036]</td><td><span class="pill p-pass">BETTER</span></td>
+      <tr class="hi"><td class="name">dag_mined</td><td class="n">1,484</td><td class="n">+0.025</td>
+        <td class="n">[+0.021, +0.029]</td><td><span class="pill p-pass">BETTER</span></td>
         <td><span class="pill p-pass">AGREES</span></td></tr>
-      <tr><td class="name">generated</td><td class="n">1,500</td><td class="n">&minus;0.083</td>
-        <td class="n">[&minus;0.099, &minus;0.068]</td><td><span class="pill p-fail">WORSE</span></td>
+      <tr><td class="name">generated</td><td class="n">1,500</td><td class="n">&minus;0.100</td>
+        <td class="n">[&minus;0.117, &minus;0.084]</td><td><span class="pill p-fail">WORSE</span></td>
         <td><span class="pill p-fail">OPPOSITE</span></td></tr>
-      <tr><td class="name">usage_mined</td><td class="n">1,483</td><td class="n">&minus;0.186</td>
-        <td class="n">[&minus;0.206, &minus;0.165]</td><td><span class="pill p-fail">WORSE</span></td>
+      <tr><td class="name">usage_mined</td><td class="n">1,484</td><td class="n">&minus;0.274</td>
+        <td class="n">[&minus;0.296, &minus;0.252]</td><td><span class="pill p-fail">WORSE</span></td>
         <td><span class="pill p-fail">OPPOSITE</span></td></tr>
-      <tr><td class="name">anchor &middot; haiku-4-5</td><td class="n">120</td><td class="n">+0.650</td>
+      <tr><td class="name">anchor &middot; haiku-4-5 (10 Sep)</td><td class="n">120</td><td class="n">+0.650</td>
         <td class="n">[+0.550, +0.750]</td><td><span class="pill p-pass">BETTER</span></td><td class="n">n/a</td></tr>
-      <tr><td class="name">anchor &middot; sonnet-5</td><td class="n">120</td><td class="n">+0.783</td>
+      <tr><td class="name">anchor &middot; sonnet-5 (10 Sep)</td><td class="n">120</td><td class="n">+0.783</td>
         <td class="n">[+0.675, +0.883]</td><td><span class="pill p-pass">BETTER</span></td><td class="n">n/a</td></tr>
     </tbody>
   </table></div>
 
   <p class="col"><code>dag_mined</code> and <code>usage_mined</code> differ by
-  <strong>0.218 nDCG</strong> on the same corpus, the same two scorers, the same
+  <strong>0.299 nDCG</strong> on the same corpus, the same two scorers, the same
   afternoon, and land on opposite sides of the ship/block line. Both are free,
   both derive from data the product already holds, and both look entirely respectable
   in isolation. That is the brief's thesis: label <em>quality</em> and label
   <em>usefulness</em> are different properties, demonstrated rather than argued.</p>
 
+  <p class="col">Hold the size loosely and the direction firmly. The first version's
+  sample read 0.218; this one reads 0.299, and 0.308 with the code from before the
+  fixes. The verdicts did not move in any of the three.</p>
+
   <p class="col">The direction is predictable in hindsight. <code>usage_mined</code>
   labels are built from what the incumbent surfaced in its own top 3, so a scorer that
   finds something the incumbent never showed is punished by construction. The brief
-  calls this the source to be genuinely afraid of. It is off by 0.218.</p>
+  calls this the source to be genuinely afraid of. It is off by 0.299.</p>
 
   <h3>Three of the brief's five sources; two are structurally unavailable</h3>
   <div class="tw"><table>
@@ -216,14 +270,15 @@ strong{font-weight:600}
   'dag_mined' are derived from it. The comparison would score the scorer on its own
   feature.</div>
   <p class="col">Against the two sources that <em>could</em> score it,
-  <code>graph_boost</code> is catastrophic: &minus;0.665 on
-  <code>generated</code>, &minus;0.497 on <code>usage_mined</code>; in-degree promotes
+  <code>graph_boost</code> is catastrophic: &minus;0.781 on
+  <code>generated</code>, &minus;0.675 on <code>usage_mined</code>; in-degree promotes
   heavily-cited papers, which is precisely wrong when the task is to find one specific
-  paper. But that is the side note. The finding is that the only label source which
-  picked the right winner is also the one that disqualifies any scorer reading graph
-  structure, while the brief's own recommended stack includes graph-aware
-  retrieval (&sect;6.10). Those two recommendations collide, and the collision is
-  invisible unless the guard is mechanical.</p>
+  paper. It now counts only the citations that existed on the query's date, where it
+  used to count the whole record's; with the whole record's it read &minus;0.650 and &minus;0.604 on this sample, because knowing which papers would be cited later was softening the damage. But that is the side note. The finding is
+  that the only label source which picked the right winner is also the one that
+  disqualifies any scorer reading graph structure, while the brief's own recommended
+  stack includes graph-aware retrieval (&sect;6.10). Those two recommendations collide,
+  and the collision is invisible unless the guard is mechanical.</p>
 </section>
 
 <section>
@@ -232,7 +287,7 @@ strong{font-weight:600}
 , and they are from the same family, so that is an optimistic ceiling.</div>
 
   <div class="tw"><table>
-    <caption>150 pairs, bm25 vs hybrid_rrf_fresh. Noise floor measured separately over 100 repeated identical calls.</caption>
+    <caption>150 pairs, bm25 vs hybrid_rrf_fresh, on the 10 September sample; not re-run. Noise floor measured separately over 100 repeated identical calls.</caption>
     <thead><tr><th>Judge</th><th class="n">&kappa; vs nDCG</th><th class="n">Swap flips</th>
       <th class="n">Noise floor</th><th class="n">Position-attributable</th><th class="n">Picks first</th></tr></thead>
     <tbody>
@@ -269,7 +324,8 @@ strong{font-weight:600}
 <section>
   <div class="branch"><span class="tag">C</span><h2>The long record</h2></div>
   <div class="stamp">Degradation is monotonic across a 10&times; corpus, and the
-  candidates' <em>relative</em> advantage grows as the record gets longer.</div>
+  candidates' <em>relative</em> advantage grows as the record gets longer:
+  hybrid_rrf_fresh starts below bm25 at 6,000 cards and ends a third above it at 60,000.</div>
 
   <figure>
   <svg viewBox="0 0 720 368" role="img" aria-label="nDCG@10 against corpus size for three scorers, degrading from left to right">
@@ -285,27 +341,34 @@ strong{font-weight:600}
       <text x="70" y="326">6,000</text><text x="394" y="326">20,000</text><text x="690" y="326">60,000</text>
       <text x="380" y="352" font-size="11" letter-spacing="1.5">CARDS IN CORPUS</text>
     </g>
-    <polyline points="70,95.7 394,188.4 690,248.7" fill="none" stroke="var(--muted)" stroke-width="2"/>
-    <polyline points="70,71.4 394,146.1 690,215.4" fill="none" stroke="var(--accent)" stroke-width="2"/>
-    <polyline points="70,54.3 394,132.6 690,205.5" fill="none" stroke="var(--pass)" stroke-width="2.5"/>
+    <polyline points="70,108.5 394,194.3 690,250.3" fill="none" stroke="var(--muted)" stroke-width="2"/>
+    <polyline points="70,120.5 394,192.7 690,233.2" fill="none" stroke="var(--accent)" stroke-width="2"/>
+    <polyline points="70,83.4 394,166.9 690,213.2" fill="none" stroke="var(--pass)" stroke-width="2.5"/>
     <g stroke="var(--ground)" stroke-width="2">
-      <circle cx="70" cy="95.7" r="4" fill="var(--muted)"/><circle cx="394" cy="188.4" r="4" fill="var(--muted)"/><circle cx="690" cy="248.7" r="4" fill="var(--muted)"/>
-      <circle cx="70" cy="71.4" r="4" fill="var(--accent)"/><circle cx="394" cy="146.1" r="4" fill="var(--accent)"/><circle cx="690" cy="215.4" r="4" fill="var(--accent)"/>
-      <circle cx="70" cy="54.3" r="4.5" fill="var(--pass)"/><circle cx="394" cy="132.6" r="4.5" fill="var(--pass)"/><circle cx="690" cy="205.5" r="4.5" fill="var(--pass)"/>
+      <circle cx="70" cy="108.5" r="4" fill="var(--muted)"/><circle cx="394" cy="194.3" r="4" fill="var(--muted)"/><circle cx="690" cy="250.3" r="4" fill="var(--muted)"/>
+      <circle cx="70" cy="120.5" r="4" fill="var(--accent)"/><circle cx="394" cy="192.7" r="4" fill="var(--accent)"/><circle cx="690" cy="233.2" r="4" fill="var(--accent)"/>
+      <circle cx="70" cy="83.4" r="4.5" fill="var(--pass)"/><circle cx="394" cy="166.9" r="4.5" fill="var(--pass)"/><circle cx="690" cy="213.2" r="4.5" fill="var(--pass)"/>
     </g>
     <g font-family="IBM Plex Mono, monospace" font-size="12">
-      <text x="112" y="46" fill="var(--pass)">rerank</text>
-      <text x="112" y="76" fill="var(--accent)">hybrid_rrf_fresh</text>
-      <text x="112" y="105" fill="var(--muted)">bm25</text>
-      <text x="640" y="196" fill="var(--pass)" text-anchor="end">0.105</text>
-      <text x="640" y="228" fill="var(--accent)" text-anchor="end">0.094</text>
-      <text x="640" y="262" fill="var(--muted)" text-anchor="end">0.057</text>
+      <text x="112" y="80" fill="var(--pass)">rerank</text>
+      <text x="112" y="108" fill="var(--muted)">bm25</text>
+      <text x="112" y="150" fill="var(--accent)">hybrid_rrf_fresh</text>
+      <text x="640" y="199" fill="var(--pass)" text-anchor="end">0.096</text>
+      <text x="640" y="222" fill="var(--accent)" text-anchor="end">0.074</text>
+      <text x="640" y="262" fill="var(--muted)" text-anchor="end">0.055</text>
     </g>
   </svg>
-  <figcaption>254 queries, with exactly 2,000 judged documents pinned into every scale
-  point so growth adds distractors rather than deleting answers. BM25 loses 75% of its
-  nDCG over the 10&times; range; hybrid_rrf_fresh loses 63%.</figcaption>
+  <figcaption>277 queries, with 2,007 judged documents pinned into every scale point so
+  growth adds distractors rather than deleting answers. BM25 loses 74% of its nDCG over
+  the 10&times; range; hybrid_rrf_fresh loses 63%, rerank 60%.</figcaption>
   </figure>
+
+  <p class="col">The as-of fix lowered both candidates, most at the small end: paired
+  against the old rule, hybrid_rrf_fresh loses 0.027 at 6,000 and at 20,000 cards and
+  0.005 at 60,000. At every point the old rule knew which papers would be revised after
+  the query. At the small points it also asked the <em>full</em> record which versions
+  had successors, and a scale point is a smaller record: there, a version whose
+  successor was not sampled is the current one.</p>
 
   <h3>Abstention is where the gap is largest</h3>
   <div class="tw"><table>
@@ -313,61 +376,71 @@ strong{font-weight:600}
     <thead><tr><th>Scorer</th><th class="n">Threshold</th><th class="n">Answers a no-answer query</th>
       <th class="n">Abstains on an answerable one</th></tr></thead>
     <tbody>
-      <tr><td class="name">bm25</td><td class="n">21.86</td>
-        <td class="n"><span class="pill p-fail">33.3%</span></td><td class="n">6.5%</td></tr>
+      <tr><td class="name">bm25</td><td class="n">22.80</td>
+        <td class="n"><span class="pill p-fail">31.7%</span></td><td class="n">7.1%</td></tr>
       <tr class="hi"><td class="name">hybrid_rrf_fresh</td><td class="n">0.032</td>
-        <td class="n"><span class="pill p-pass">0.0%</span></td><td class="n">5.2%</td></tr>
-      <tr class="hi"><td class="name">rerank</td><td class="n">9.03</td>
-        <td class="n"><span class="pill p-pass">0.0%</span></td><td class="n">6.5%</td></tr>
+        <td class="n"><span class="pill p-pass">0.0%</span></td><td class="n">11.9%</td></tr>
+      <tr class="hi"><td class="name">rerank</td><td class="n">9.14</td>
+        <td class="n"><span class="pill p-pass">0.0%</span></td><td class="n">9.5%</td></tr>
     </tbody>
   </table></div>
-  <p class="col">At a matched operating point, BM25 fabricates an answer for a third of
-  queries whose evidence is genuinely absent from the corpus; both candidates never do.
-  The effect is so large that <strong>~16</strong> no-answer queries would suffice to
-  call it. The brief worries you need several hundred and nobody wants to write them;
-  here the subsetting produced them for free: every no-answer query is the title
-  of a real paper held outside the sampled corpus, so its emptiness is verifiable rather
-  than asserted.</p>
+  <p class="col">At a matched operating point, BM25 fabricates an answer for nearly a
+  third of queries whose evidence is genuinely absent from the corpus; both candidates
+  never do. The effect is so large that <strong>~17</strong> no-answer queries would
+  suffice to call it. The brief worries you need several hundred and nobody wants to
+  write them; here the subsetting produced them for free: every no-answer query is the
+  title of a real paper held outside the sampled corpus, so its emptiness is verifiable
+  rather than asserted.</p>
 </section>
 
 <section>
   <div class="branch"><span class="tag">D</span><h2>Run it every day</h2></div>
-  <div class="stamp">Two candidates clear every hard check and ship.
-  <code>hybrid_rrf</code> is blocked by 2,532 supersession failures.</div>
+  <div class="stamp">One candidate clears every hard check and ships.
+  <code>hybrid_rrf</code> is blocked by 2,621 supersession failures, and
+  <code>rerank</code>, the best scorer here, by a single no-answer query it answered.</div>
 
   <div class="tw"><table>
-    <caption>n = 1,483 dag-mined queries, paired, 2,000 bootstrap resamples, held out by proofline.</caption>
+    <caption>n = 1,484 dag-mined queries, paired, 2,000 bootstrap resamples, held out by proofline.</caption>
     <thead><tr><th>Candidate</th><th class="n">&Delta;</th><th class="n">95% CI</th>
       <th class="n">MDE</th><th class="n">n@0.02</th><th class="n">Superseded</th>
       <th class="n">No-answer</th><th>Decision</th></tr></thead>
     <tbody>
-      <tr><td class="name">hybrid_rrf</td><td class="n">+0.012</td><td class="n">[+0.009, +0.015]</td>
-        <td class="n">0.005</td><td class="n">84</td>
-        <td class="n"><span class="pill p-fail">2,532</span></td>
-        <td class="n"><span class="pill p-fail">32</span></td>
+      <tr><td class="name">hybrid_rrf</td><td class="n">+0.011</td><td class="n">[+0.008, +0.014]</td>
+        <td class="n">0.005</td><td class="n">76</td>
+        <td class="n"><span class="pill p-fail">2,621</span></td>
+        <td class="n"><span class="pill p-fail">44</span></td>
         <td><span class="pill p-fail">BLOCK</span></td></tr>
-      <tr><td class="name">hybrid_rrf_fresh</td><td class="n">+0.027</td><td class="n">[+0.023, +0.032]</td>
-        <td class="n">0.006</td><td class="n">147</td>
+      <tr class="hi"><td class="name">hybrid_rrf_fresh</td><td class="n">+0.022</td><td class="n">[+0.018, +0.026]</td>
+        <td class="n">0.006</td><td class="n">128</td>
         <td class="n"><span class="pill p-pass">0</span></td><td class="n"><span class="pill p-pass">0</span></td>
         <td><span class="pill p-pass">SHIP</span></td></tr>
-      <tr class="hi"><td class="name">rerank</td><td class="n">+0.039</td><td class="n">[+0.034, +0.044]</td>
-        <td class="n">0.007</td><td class="n">178</td>
-        <td class="n"><span class="pill p-pass">0</span></td><td class="n"><span class="pill p-pass">0</span></td>
-        <td><span class="pill p-pass">SHIP</span></td></tr>
+      <tr><td class="name">rerank</td><td class="n">+0.038</td><td class="n">[+0.034, +0.043]</td>
+        <td class="n">0.007</td><td class="n">159</td>
+        <td class="n"><span class="pill p-pass">0</span></td>
+        <td class="n"><span class="pill p-fail">1</span></td>
+        <td><span class="pill p-fail">BLOCK</span></td></tr>
     </tbody>
   </table></div>
 
-  <p class="col">Nothing came back <code>UNDERPOWERED</code>. At n = 1,483 the minimum
-  detectable effect is 0.005&ndash;0.023, and 84 to 178 queries, depending on the
+  <p class="col">Nothing came back <code>UNDERPOWERED</code>. At n = 1,484 the minimum
+  detectable effect is 0.005&ndash;0.019, and 76 to 159 queries, depending on the
   candidate, would resolve the 0.02
   target. The same harness on the synthetic corpus at n = 219 returned UNDERPOWERED on
   every single slice. That contrast is the brief's sizing argument made concrete: the
   test set was the binding constraint, not the scorers.</p>
 
+  <p class="col"><code>rerank</code>'s block is the gate doing what it says. One of 300
+  no-answer queries came back answered at its calibrated threshold, and one occurrence
+  blocks: a hard check is never averaged into a score that looks fine. The same query
+  (<code>q_na_dg_000099</code>) fails with the code from before the fixes, so it is this
+  sample's, not the fixes';
+  the first version's sample happened to hold none.</p>
+
   <p class="col">Two details worth trusting. <code>recently_changed</code> is
-  <code>hybrid_rrf_fresh</code>'s strongest slice (+0.054, double its overall), precisely where a freshness filter should pay, so the mechanism is working as designed
-  rather than by accident. And the held-out-proofline slice beats the dev split for all
-  three candidates (+0.054 vs +0.037 for rerank), which is the opposite of the leakage
+  <code>hybrid_rrf_fresh</code>'s strongest slice (+0.043, double its overall), precisely
+  where a freshness filter should pay, so the mechanism is working as designed rather
+  than by accident. And the held-out-proofline slice beats the dev split for all three
+  candidates (+0.041 vs +0.034 for rerank), which is the opposite of the leakage
   pattern the brief warns about.</p>
 </section>
 
@@ -381,11 +454,11 @@ strong{font-weight:600}
     <thead><tr><th class="n">#</th><th>Branch</th><th>What this run showed</th></tr></thead>
     <tbody>
       <tr class="hi"><td class="n">1</td><td class="name">A &middot; label sources</td>
-        <td>0.218 nDCG between two respectable sources, on opposite sides of the ship line</td></tr>
+        <td>0.299 nDCG between two respectable sources, on opposite sides of the ship line</td></tr>
       <tr><td class="n">2</td><td class="name">D &middot; the loop</td>
         <td>the same gate, on <code>usage_mined</code>, blocks the change that shipped</td></tr>
       <tr><td class="n">3</td><td class="name">C &middot; the long record</td>
-        <td>the candidate-set filter: largest single step, and the BLOCK&rarr;SHIP flip</td></tr>
+        <td>the candidate-set filter: the BLOCK&rarr;SHIP flip, 2,621 failures to zero</td></tr>
       <tr><td class="n">4</td><td class="name">B &middot; judge or metric</td>
         <td>costliest by far; &kappa;=0.462 between judges, &kappa;=&minus;0.007 for the better one</td></tr>
     </tbody>
@@ -393,16 +466,18 @@ strong{font-weight:600}
 
   <p class="col"><strong>&ldquo;Build D as a reporter first&rdquo; is no longer a
   caution.</strong> The identical Branch D machinery, pointed at <code>usage_mined</code>
-  instead of <code>dag_mined</code>, returns WORSE and blocks <code>hybrid_rrf_fresh</code>
-, the candidate that ships on every hard check and every slice. Not a hypothetical
+  instead of <code>dag_mined</code>, returns WORSE and blocks <code>hybrid_rrf_fresh</code>,
+  the candidate that ships on every hard check and every slice. Not a hypothetical
   about automating confident wrong answers on a schedule; a specific release decision
   inverted by a label-source choice, where both sources look respectable.</p>
 
-  <p class="col"><strong>One place the data pushes back.</strong> C sits third as an
-  evaluation branch, and that is right for build order. But its single idea, moving supersession out of the ranker and into the candidate set, was the
-  largest retrieval win measured here <em>and</em> the change that flipped the gate.
-  On the build-order axis C is third; on the &ldquo;what actually improved retrieval&rdquo;
-  axis its one insight beat everything else tried, including the cross-encoder.</p>
+  <p class="col"><strong>Where C sits.</strong> Third as an evaluation branch, and its
+  filter is now the smallest of the three retrieval steps, level with fusion, once it
+  is measured without the future. Its single idea,
+  moving supersession out of the ranker and into the candidate set, is still the change
+  that flips the gate: no ranking weight turns 2,621 failures into zero. The first
+  version called it the largest retrieval win as well; that part came from a filter
+  that knew which papers would be revised later.</p>
 
   <p class="col"><strong>B last is confirmed on cost as well as value.</strong> It
   consumed real money, three failed runs and several hours of wall clock, and returned
@@ -412,11 +487,12 @@ strong{font-weight:600}
 </section>
 
 <section>
-  <h2>What the numbers confirm, and one place they correct</h2>
+  <h2>What the numbers confirm</h2>
 
-  <div class="stamp">The upstream bundle is worth <strong>2.3&times;</strong> the gap
-  between the two scorers under debate. The brief's caveat holds, and that is a
-  floor, since field-weighted lexical was never tested.</div>
+  <div class="stamp">The upstream bundle is worth <strong>2.44&times;</strong> the gap
+  between the two scorers under debate, and the cross-encoder is its larger half. The
+  brief's caveat holds, and that is a floor, since field-weighted lexical was never
+  tested.</div>
 
   <p class="col">The brief warns that if the goal is better retrieval rather than better
   evaluation, the largest win is probably not in any of the four branches: it is a
@@ -424,34 +500,34 @@ strong{font-weight:600}
   Decomposed step by step, that is what the data says.</p>
 
   <div class="tw"><table>
-    <caption>Branch D, n = 1,483. Each step measured over the one above it, same queries, same baseline.</caption>
+    <caption>Branch D, n = 1,484. Each step measured over the one above it, same queries, same baseline.</caption>
     <thead><tr><th>Step</th><th class="n">nDCG@10</th><th class="n">Gain</th><th>Role</th></tr></thead>
     <tbody>
-      <tr><td class="name">bm25</td><td class="n">0.0516</td><td class="n">, </td>
+      <tr><td class="name">bm25</td><td class="n">0.0474</td><td class="n"></td>
         <td>the incumbent</td></tr>
-      <tr><td class="name">+ RRF fusion &rarr; hybrid_rrf</td><td class="n">0.0636</td>
-        <td class="n">+0.0119</td><td>the gap under debate</td></tr>
-      <tr class="hi"><td class="name">+ candidate-set filter &rarr; _fresh</td><td class="n">0.0791</td>
-        <td class="n">+0.0155</td><td>upstream work</td></tr>
-      <tr class="hi"><td class="name">+ cross-encoder &rarr; rerank</td><td class="n">0.0910</td>
-        <td class="n">+0.0119</td><td>upstream work</td></tr>
+      <tr><td class="name">+ RRF fusion &rarr; hybrid_rrf</td><td class="n">0.0585</td>
+        <td class="n">+0.0111</td><td>the gap under debate</td></tr>
+      <tr class="hi"><td class="name">+ candidate-set filter &rarr; _fresh</td><td class="n">0.0692</td>
+        <td class="n">+0.0106</td><td>upstream work</td></tr>
+      <tr class="hi"><td class="name">+ cross-encoder &rarr; rerank</td><td class="n">0.0857</td>
+        <td class="n">+0.0165</td><td>upstream work</td></tr>
     </tbody>
   </table></div>
 
   <p class="col">The two scorers whose comparison the whole exercise exists to settle
-  differ by <strong>+0.0119</strong>, the <em>smallest</em> of the three steps.
-  The upstream work still on the table is worth <strong>+0.0274</strong>, or
-  <strong>2.30&times;</strong> as much. Three months of measurement would resolve the
-  smaller number.</p>
+  differ by <strong>+0.0111</strong>. The upstream work still on the table is worth
+  <strong>+0.0271</strong>, or <strong>2.44&times;</strong> as much. Three months of
+  measurement would resolve the smaller number.</p>
 
-  <p class="col">The one correction is narrower than it first looks. Within that bundle
-  the candidate-set filter (+0.0155) is at least as large as the cross-encoder
-  (+0.0119), so &ldquo;reranking is probably the single largest available win&rdquo;
-  does not hold: the cheap metadata filter edges the model. But the two steps are
-  close, and separating them properly needs a paired test on the difference, which was
-  not run.</p>
+  <p class="col">The first version of this page corrected the brief here: its filter step
+  (+0.0155) edged the cross-encoder (+0.0119), so &ldquo;reranking is probably the single
+  largest available win&rdquo; did not hold. That correction was wrong. On the same
+  sample, the filter reads +0.0166 when it drops what was superseded by the end of the
+  record and +0.0106 when it drops only what was superseded by the query's date, while
+  the cross-encoder goes from +0.0111 to +0.0165 on top of it. The brief's claim stands.
+  A paired test on the difference between the two steps was still not run.</p>
 
-  <h3>Three corrections found by running it</h3>
+  <h3>Five corrections found by running it</h3>
   <ul>
     <li><strong>&ldquo;Every branch except B1's label comparison runs unchanged on real
     data&rdquo; is false.</strong> Six sites outside Branch A hardcoded the
@@ -466,6 +542,13 @@ strong{font-weight:600}
     point silently becomes 30k. Sampling had to run against a judged-document budget,
     not a query count: the Branch C trap, one level up from where the brief
     catches it.</li>
+    <li><strong>&ldquo;Current&rdquo; has a date.</strong> A supersession filter that asks
+    the end of the record which versions are current scores well and is wrong: it
+    knows which papers will be revised. It must ask as of each query, or the
+    freshness rule becomes a leak from the future.</li>
+    <li><strong>A sample that moves between runs is not a result.</strong> The snowball
+    followed Python's salted set order, so the first version's corpus could not be
+    drawn again, and the Branch A gap moved by 0.09 between draws.</li>
   </ul>
 </section>
 
@@ -475,16 +558,19 @@ strong{font-weight:600}
   <p><strong>The anchor is a judge, not a human.</strong> A judge-anchored Branch A is
   weaker evidence than a human-anchored one, and the judge grading the label sources has
   measured biases of its own.</p>
+  <p><strong>The anchors and Branch B are from the first sample.</strong> They were not
+  re-run, since they cost money. The anchors judged hybrid_rrf_fresh over bm25 on the
+  first sample; every label source gives the same verdict on this sample as it did
+  there, so the AGREES / OPPOSITE column is carried over, not re-measured.</p>
   <p><strong>Both judges are from one family.</strong> The cross-family comparison the
   brief asks for was blocked by an exhausted daily quota. Two Anthropic models should
   agree <em>more</em> than two from different vendors, so &kappa; = 0.462 is an
   optimistic ceiling, which strengthens rather than weakens the conclusion.</p>
   <p><strong>Some hard-check zeros are true by construction.</strong>
-  <code>hybrid_rrf_fresh</code> and <code>rerank</code> filter to current versions, so
-  they cannot rank a superseded card above its successor. That is the design working as
-  intended, but it is not a ranking achievement. They are also handicapped: some
-  citation-derived relevance targets <em>are</em> superseded versions, which those
-  scorers can never retrieve.</p>
+  <code>hybrid_rrf_fresh</code> and <code>rerank</code> filter to the versions current on
+  the query's date, so they cannot rank a superseded card above its successor. That is
+  the design working as intended, not a ranking achievement. The handicap the first
+  version noted is gone: every citation target is reachable now.</p>
   <p><strong>The distractor taxonomy collapsed.</strong> Setting
   <code>proofline_id</code> to the arXiv category made &ldquo;sibling in the same
   proofline&rdquo; mean &ldquo;same category&rdquo;, nearly every paper. It reads
@@ -497,7 +583,8 @@ strong{font-weight:600}
   judge anchor alone, with no independent corroboration.</p>
   <p><strong>9.7% of citation edges were lost</strong> in the MAG&harr;arXiv title join,
   and the loss is not random: it skews toward older and oddly-formatted records,
-  adding a second layer of incompleteness on top of the real one Branch A studies.</p>
+  adding a second layer of incompleteness on top of the real one Branch A studies. A
+  further 1.1% pointed at a version written after the citing paper and are dropped.</p>
   </div>
 </section>
 
@@ -509,23 +596,25 @@ strong{font-weight:600}
   before it is believed.</p>
 
   <p class="col">What changed is where the leverage sits. On a synthetic corpus at
-  n = 219 every slice was underpowered and no verdict was resolvable; on 60,001 real
-  cards at n = 1,483 every verdict is decisive and the binding constraint turns out to
+  n = 219 every slice was underpowered and no verdict was resolvable; on 60,000 real
+  cards at n = 1,484 every verdict is decisive and the binding constraint turns out to
   have been the test set all along. The most consequential single decision in the whole
   exercise was not which scorer to use. It was <em>which label source to believe</em>,
-  where two free, plausible, internally-consistent options disagree by 0.218 nDCG and
+  where two free, plausible, internally-consistent options disagree by 0.299 nDCG and
   point to opposite release decisions.</p>
 
-  <p class="col">And the cheapest guarantee was worth more than the cleverest model.
+  <p class="col">And the cheapest guarantee is still the one that decides the release.
   Moving supersession out of the ranker and into the candidate set took one metadata
-  filter, converted 2,532 hard-check failures into zero, added more nDCG than either
-  the fusion step or the cross-encoder, and turned a <code>BLOCK</code> into a
-  <code>SHIP</code>. It is also the step that makes a hard zero possible at all: a
-  ranking weight can shrink an error class, only a filter can eliminate it.</p>
+  filter, converted 2,621 hard-check failures into zero, and turned a <code>BLOCK</code>
+  into a <code>SHIP</code>. It does not out-score the cross-encoder; the version of this
+  page that said so was measuring a filter that could see the future. A ranking weight
+  can shrink an error class, only a filter can eliminate it, and a filter is only as
+  honest as the date it asks.</p>
 
   <p class="foot" style="margin-top:2.4em">Measured with <code>proofline_eval.py</code>
-  against 60,001 arXiv cards, SPECTER2 embeddings, Postgres 16. Every figure on this
-  page comes from a run recorded in <code>.proofline/reports/</code>; none is estimated.</p>
+  against 60,000 arXiv cards, SPECTER2 embeddings, Postgres 16. Every figure on this
+  page comes from a run recorded under <code>.proofline/</code> (Branch B and the judge
+  anchors from the 10 September run); none is estimated.</p>
 </section>
 
 </div>
