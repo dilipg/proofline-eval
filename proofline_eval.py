@@ -4067,12 +4067,22 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
 
     runs: dict[str, RunResult] = {}
     walker = make_walker(cfg.walker) if "onto_llm_walk" in names else None
+    # The walker is capped (it costs money), so its sample is drawn round-robin across
+    # families: the first N ids alone are one family, and the comparison would be too.
+    by_fam: dict[str, list[Query]] = defaultdict(list)
+    for q in sorted(tst or qs, key=lambda q: q.id):
+        by_fam[q.family].append(q)
+    walker_pick: list[Query] = []
+    while len(walker_pick) < cfg.llm_queries and any(by_fam.values()):
+        for f in sorted(by_fam):
+            if by_fam[f] and len(walker_pick) < cfg.llm_queries:
+                walker_pick.append(by_fam[f].pop(0))
     for n in names:
         sc = SCORERS[n]()
         target = qs + twins
         if n == "onto_llm_walk":
             sc.walker = walker
-            keep_ids = {q.id for q in (tst or qs)[:cfg.llm_queries]}
+            keep_ids = {q.id for q in walker_pick}
             groups = {q.pair_id for q in qs if q.id in keep_ids and q.pair_id}
             target = [q for q in every if q.id in keep_ids or (q.pair_id and q.pair_id in groups)]
         runs[n] = execute_run(store, sc, embedder, target, "multihop", None, cfg.topk, tracer,
@@ -4153,6 +4163,7 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
 
     return dict(queries=counts, dropped=dropped, skipped=skipped, thresholds=thr,
                 scorers=summary, oracle=oracle_out, comparisons=comparisons,
+                walker_sample=dict(Counter(q.family for q in walker_pick)) if walker else {},
                 walker_errors=getattr(walker, "errors", 0) if walker else 0)
 
 # ----------------------------------------------------------------------------------

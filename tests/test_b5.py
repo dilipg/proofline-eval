@@ -52,6 +52,10 @@ def test_b5_walks_an_extraction(ingested):
         out = pe.branch5_multihop(store, pe.Config(profile="smoke", extractor="test:truth"), emb, _NoTrace())
         assert not out["skipped"] and "onto_walk" in out["scorers"]
         assert out["scorers"]["onto_walk"]["n"] > 0
+        # the capped walker sample spans families (sorted ids would give one family only)
+        small = pe.branch5_multihop(store, pe.Config(profile="smoke", extractor="test:truth",
+                                                     llm_queries=14), emb, _NoTrace())
+        assert len(small["walker_sample"]) >= 5, small["walker_sample"]
     finally:
         with store.conn.cursor() as cur:
             for t in ("entities", "mentions", "extracted_cards"):
