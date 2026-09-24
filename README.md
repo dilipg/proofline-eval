@@ -163,6 +163,37 @@ category. Papers held outside the sampled subset become genuine no-answer querie
 
 ---
 
+## Ontology ingestion (Semantica)
+
+The synthetic corpus plants a typed entity layer: methods, datasets, metrics, materials
+and organisms. The relations between them (`extends`, `evaluated_on`, `measured_by`,
+`reports`) are written into card text in several phrasings, and recorded as truth.
+`ingest_semantica.py` extracts that layer back out with [Semantica](https://github.com/semantica-agi/semantica)
+(pinned 0.7.0), resolves aliases, gives every fact a validity window from the version
+chain, and writes it next to the cards. B1 then grades each extractor against the truth.
+
+    uv run proofline_eval.py seed --profile quick
+    uv run ingest_semantica.py --method regex                  # offline
+    uv run ingest_semantica.py --method llm --extract-limit 300 # anthropic:claude-haiku-4-5
+    uv run proofline_eval.py b1
+
+The default model is Claude Haiku 4.5. `--llm anthropic:claude-opus-5` is slower and costlier.
+Extraction is cached by card text, so re-seeding does not re-bill. `all` re-seeds and
+empties the extracted tables, so run it before extracting, not after.
+
+`--viz` (or `--viz-only`) draws the result into `.proofline/viz/`. Each picture is
+masked at an as-of date, so it shows the record as it stood then:
+- `dag.html`: the citation DAG
+- `ontology.html`: cards, entities and the typed facts between them
+- `ontology-classes.html`: the inferred class hierarchy
+- `timeline.html`: the same neighbourhood at several dates
+- `graph.json`: open with `semantica-explorer --graph .proofline/viz/graph.json`,
+  after `pip install "semantica[explorer]"`
+
+`--no-entities` reproduces the pre-ontology corpus byte for byte.
+
+---
+
 ## Scorers
 
 | name | graph? | what it is |
@@ -185,10 +216,12 @@ Embedders: `hash` (offline, deterministic), `sentence-transformers`, `openai`,
 ```
 proofline_eval.py     the harness
 prepare_arxiv.py      join the two arXiv sources into the cached loader inputs
+ingest_semantica.py   ontology ingestion with Semantica (extract, resolve, visualize)
 branch_a_anchor.py    grade label sources by verdict agreement against a judge anchor
 judge_noise_floor.py  separate a judge's position bias from its sampling noise
 RESULTS.html          findings from the full four-branch run on 60k arXiv cards
 .proofline/reports/   one JSON per run; every printed number is also written here
+tests/                pytest unit tests; add --with semantica[...] to run the adapter tests
 ```
 
 `uv run proofline_eval.py reset` drops the tables. `--fresh` re-seeds before running.
