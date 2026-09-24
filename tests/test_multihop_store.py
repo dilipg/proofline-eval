@@ -3,7 +3,8 @@ import proofline_eval as pe
 
 def test_multihop_round_trips(seeded, smoke_corpus):
     want = {q.id: q for q in smoke_corpus.queries["multihop"]}
-    got = {q.id: q for q in pe.load_queries(seeded, "multihop")}
+    # storage, not filtering: include what the disconnection filter (another test) dropped
+    got = {q.id: q for q in pe.load_queries(seeded, "multihop", include_dropped=True)}
     assert set(got) == set(want) and want
     for qid, q in want.items():
         g = got[qid]

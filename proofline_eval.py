@@ -2945,6 +2945,47 @@ def build_usage_mined(store: Store, cfg: Config, embedder: Embedder,
     return len(rows_q)
 
 
+def filter_disconnected(store: Store, cfg: Config, embedder: Embedder) -> dict:
+    """MuSiQue's disconnection test. For every query with a last hop, hide the first
+    hop's card and ask single-hop BM25 and dense for the answer's card. If either finds
+    it in the top k, the question never needed the hop: drop it, and drop its pair with
+    it, because half a contrast pair measures nothing. Re-running resets and recomputes."""
+    counts: dict = {f: {"kept": 0, "dropped": 0} for f in LAST_HOP_FAMILIES}
+    counts["pairs_dropped"] = 0
+    every = load_queries(store, "multihop", include_dropped=True)
+    qs = [q for q in every if q.answerable and q.family in LAST_HOP_FAMILIES]
+    with store.conn.cursor() as cur:
+        cur.execute("UPDATE queries SET dropped = NULL WHERE provenance = 'multihop'")
+    if not qs:
+        return counts
+    idx = build_index(store, None)
+    single: set[str] = set()
+    for q in qs:
+        m = idx.snapshot_mask(q.as_of).copy()
+        for cid in q.slots[0]:
+            if cid in idx.pos:
+                m[idx.pos[cid]] = False
+        lex = np.where(m, idx.bm25(q.text), -np.inf)
+        den = np.where(m, idx.cosine(embedder.encode_queries([q.text])[0]), -np.inf)
+        top = {idx.ids[i] for i in topn(lex, cfg.topk) if np.isfinite(lex[i]) and lex[i] > 0}
+        top |= {idx.ids[i] for i in topn(den, cfg.topk) if np.isfinite(den[i])}
+        hit = bool(top & q.slots[-1])
+        counts[q.family]["dropped" if hit else "kept"] += 1
+        if hit:
+            single.add(q.id)
+    bad_groups = {q.pair_id for q in every if q.id in single and q.pair_id}
+    paired = {q.id for q in every if q.pair_id in bad_groups and q.id not in single}
+    counts["pairs_dropped"] = len(paired)
+    for q in every:          # a kept half of a dropped pair leaves the kept count
+        if q.id in paired and q.family in LAST_HOP_FAMILIES:
+            counts[q.family]["kept"] -= 1
+            counts[q.family]["dropped"] += 1
+    with store.conn.cursor() as cur:
+        cur.execute("UPDATE queries SET dropped = 'single_hop' WHERE id = ANY(%s)", (sorted(single),))
+        cur.execute("UPDATE queries SET dropped = 'pair_dropped' WHERE id = ANY(%s)", (sorted(paired),))
+    return counts
+
+
 def _norm_surface(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
@@ -3646,6 +3687,12 @@ def cmd_ingest(store: Store, cfg: Config, embedder: Embedder, tracer: Tracer) ->
         f"({mat.shape[0]/max(el,1e-9):.0f} cards/s)")
     n = build_usage_mined(store, cfg, embedder, tracer)
     log(f"  simulated click log -> {n} usage-mined queries")
+    mh = filter_disconnected(store, cfg, embedder)
+    if any(c["kept"] + c["dropped"] for f, c in mh.items() if f in LAST_HOP_FAMILIES):
+        log("  disconnection filter (a single hop finds the answer -> dropped): " + ", ".join(
+            f"{f} {c['dropped']}/{c['kept'] + c['dropped']}" for f, c in mh.items()
+            if f in LAST_HOP_FAMILIES) + f"; pair members dropped with them {mh['pairs_dropped']}")
+    tracer.event("disconnection-filter", output=mh)
 
 
 # Verb-first and free of run-specific values: evaluators, dashboard filters and
