@@ -84,7 +84,7 @@ Profiles: `smoke` (400 cards) · `quick` (2,500) · `full` (12,000) · `arxiv-sc
 
 ### Credentials
 
-Copy `.env.example` to `.env` and fill in what you need. Nothing reads a key from the
+Create a `.env` with the keys you need from the list below. Nothing reads a key from the
 command line and no key is printed.
 
 ```

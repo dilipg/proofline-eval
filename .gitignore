@@ -1,7 +1,6 @@
-# Secrets. .env.example is the template and IS tracked.
+# Secrets
 .env
 .env.*
-!.env.example
 
 # Local docs, notes and design specs
 docs/
