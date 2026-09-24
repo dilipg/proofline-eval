@@ -4,7 +4,7 @@
 # dependencies = [
 #   "numpy>=1.26",
 #   "psycopg[binary]>=3.1",
-#   "pgserver>=0.1.4; sys_platform == 'darwin' or platform_machine == 'x86_64'",
+#   "pgserver>=0.1.4; sys_platform == 'darwin' or platform_machine == 'x86_64' or platform_machine == 'AMD64'",
 #   "httpx>=0.27",
 #   "langfuse>=4.0",
 #   "sentence-transformers>=3.0",
@@ -2163,14 +2163,27 @@ def hard_checks(run: RunResult, idx_rows: dict, queries: Sequence[Query],
     }
 
 
+def truth_leak_in(src: str) -> Optional[str]:
+    """The first planted-truth literal on the retrieval/scoring path, or None.
+
+    The path runs from the §4 banner to the FIRST occurrence of the §11 banner literal,
+    which is the split call on the next line, so everything below it (including the
+    function that raises) is outside the span it checks. Every planted table is named
+    with the true_ prefix, and none of them may be read from inside the span."""
+    body = src.split("# §4  Retrieval index")[1].split("# §11  Branch")[0]
+    m = re.search(r"\btrue_(?:support|mention|fact|entit)\w*", body)
+    return m.group(0) if m else None
+
+
 def assert_no_truth_leak(store: Store) -> None:
     """The planted truth lives in the same database as everything else, which is a
     hazard. Nothing on the retrieval path may read it. This is cheap and it is the
     kind of guard that stops a harness quietly grading itself."""
-    src = Path(__file__).read_text()
-    body = src.split("# §4  Retrieval index")[1].split("# §11  Branch")[0]
-    if "true_support" in body:
-        raise SystemExit("TRUTH LEAK: the retrieval/scoring path references true_support")
+    # utf-8 explicitly: the banners carry a '§', and Windows' default codec decodes it
+    # into something the split in truth_leak_in never finds.
+    hit = truth_leak_in(Path(__file__).read_text(encoding="utf-8"))
+    if hit:
+        raise SystemExit(f"TRUTH LEAK: the retrieval/scoring path references {hit}")
 
 # ----------------------------------------------------------------------------------
 # §11  Branch experiments
@@ -2776,6 +2789,11 @@ def write_report(cfg: Config, payload: dict) -> Path:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    # Windows pipes default to cp1252, which cannot print the rule characters. Never let
+    # the console's encoding decide whether a run completes.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(
         prog="proofline_eval.py",
         description="Retrieval evaluation harness for a linked research record.",
