@@ -521,7 +521,9 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
         ds = (rng.sample(dataset_ids, k=rng.randrange(2, min(8, len(dataset_ids)) + 1))
               if multi else [rng.choice(dataset_ids)])
         if multi:
-            for d in ds:
+            # only HALF the datasets are stated outright: the full list must take the
+            # reporting cards together, or aggregate_set is a one-card question
+            for d in ds[:len(ds) // 2]:
                 tpl = rng.choice(_SAY["evaluated_on"])
                 for v in versions(intro):
                     say(v, tpl, [(mid, name, "mentions"), (d, name_of[d], "mentions")],
@@ -660,6 +662,7 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
         return next((v for v in chain(root) if valid(v, t)), None)
 
     reports: dict[str, list[tuple[Card, str, str]]] = defaultdict(list)
+    stated: dict[str, list[tuple[Card, set]]] = defaultdict(list)   # m -> (card, datasets it names)
     users: dict[str, dict[str, Card]] = defaultdict(dict)
     extends: dict[str, tuple[Card, str]] = {}
     for c in cards:
@@ -668,6 +671,12 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
                 reports[s].append((c, o, v))
             elif r == "extends" and c.supersedes_id is None:
                 extends.setdefault(s, (c, o))
+        per_m: dict[str, set] = defaultdict(set)
+        for s, r, o, _v in c.true_facts:
+            if r in ("evaluated_on", "reports"):
+                per_m[s].add(o)
+        for m_, ds_ in per_m.items():
+            stated[m_].append((c, ds_))
         if c.supersedes_id is None:
             for e, _surf, role in c.true_mentions:
                 if role == "uses" and top_class(kind[e]) == "Method":
@@ -820,6 +829,9 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
             for c, d, _v in r.values():
                 by_d[d].add(c.id)
             if fam == "aggregate_set" and not 2 <= len(by_d) <= 8:
+                continue
+            if fam == "aggregate_set" and any(valid(c, end) and set(by_d) <= ds_ for c, ds_ in stated[m]):
+                stats["skipped_single_card"] += 1         # one card already names the whole set
                 continue
             if fam == "aggregate_set":
                 order = sorted(by_d, key=lambda d: min(by_id[c].committed_at for c in by_d[d]))
@@ -2317,6 +2329,7 @@ class MockWalker:
     two hops, orders evidence by date. It never sees gold, so its numbers are evidence
     about the harness, never about a walker."""
     errors = 0
+    calls = 0
 
     def choose(self, question, as_of, evidence, candidates, hop):
         chosen = [c["id"] for c in candidates[:3]]
@@ -2331,17 +2344,27 @@ class AnthropicWalker:
 
     def __init__(self, model: str, client: Any = None, cache_path: Optional[Path] = None):
         if client is None:
+            # The SDK builds a client without credentials and fails per request, which the
+            # walk would swallow into a result. Keys come from .env, like every other key.
+            if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+                raise SystemExit("--walker anthropic:<model> needs ANTHROPIC_API_KEY in .env")
             import anthropic
             client = anthropic.Anthropic()
-        self.model, self.client, self.errors = model, client, 0
+        self.model, self.client, self.errors, self.calls = model, client, 0, 0
         self.cache = LLMCache(cache_path or STATE_DIR / "cache" / "llm.sqlite")
+
+    def cache_key(self, prompt: str) -> str:
+        """Everything that shapes a reply: an edited system prompt or schema must miss."""
+        blob = json.dumps(["anthropic", self.model, WALK_SYSTEM, WALK_SCHEMA, prompt], sort_keys=True)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def choose(self, question, as_of, evidence, candidates, hop):
         lines = [f"Question (as of {as_of.date().isoformat()}): {question}", "", "Evidence so far:"]
         lines += [f"- [{e['id']}] ({e['date']}) {e['text']}" for e in evidence]
         lines += ["", "Candidates:"] + [f"- [{c['id']}] ({c['date']}) {c['text']}" for c in candidates]
         prompt = "\n".join(lines)
-        key = hashlib.sha256(f"{self.model}\x00{prompt}".encode("utf-8")).hexdigest()
+        key = self.cache_key(prompt)
+        self.calls += 1
         allowed = {e["id"] for e in evidence} | {c["id"] for c in candidates}
         got = self.cache.get(key)
         if got is None:
@@ -4055,7 +4078,23 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
             skipped[nm] = (f"NOT INGESTED: no extraction '{cfg.extractor}'; run ingest_semantica.py "
                            f"or pass --extractor")
             log(f"  {nm}: {skipped[nm]}")
+    for n in names:
+        refused = check_circularity(SCORERS[n](), "multihop")
+        if refused and n not in skipped:
+            skipped[n] = refused
+            log(f"  {n}: {refused}")
     names = [n for n in names if n not in skipped]
+
+    extraction = None
+    if any(SCORERS[n].uses_ontology for n in names):
+        with store.conn.cursor() as cur:
+            cur.execute("SELECT count(*) n FROM extracted_cards WHERE source = %s", (cfg.extractor,))
+            read = cur.fetchone()["n"]
+        cov = read / max(1, len(meta))
+        extraction = dict(source=cfg.extractor, cards=read, of=len(meta), coverage=cov, partial=cov < 1.0)
+        log(f"  extraction: {cfg.extractor}, {read}/{len(meta)} cards ({cov:.0%})"
+            + ("  PARTIAL: a bridge needs both of its cards extracted, so the ontology rows "
+               "measure this coverage as much as the method" if cov < 1.0 else ""))
 
     idx = build_index(store, None, None, cfg.extractor if "onto_walk" in names else None)
     fs_tops = sorted(max(first_stage(idx, embedder, q).values(), default=0.0) for q in dev)
@@ -4090,6 +4129,11 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
                               extractor=cfg.extractor if sc.uses_ontology else None)
     # twins ran in the same runs; score_runs skips unanswerable queries itself but must
     # be able to look every ranked id up
+    if walker is not None and "onto_llm_walk" in runs and walker.errors > 0.05 * max(1, walker.calls):
+        skipped["onto_llm_walk"] = (f"NOT MEASURED: {walker.errors} of {walker.calls} walker calls failed "
+                                    f"(credentials, quota or refusals); its rows would be the first stage")
+        log(f"  onto_llm_walk: {skipped['onto_llm_walk']}")
+        del runs["onto_llm_walk"]
     score_runs(list(runs.values()), every, cfg.topk, ts=ts)
 
     oracle_rank = {q.id: [min(s, key=lambda c: (ts[c], c)) for s in
@@ -4164,6 +4208,7 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
     return dict(queries=counts, dropped=dropped, skipped=skipped, thresholds=thr,
                 scorers=summary, oracle=oracle_out, comparisons=comparisons,
                 walker_sample=dict(Counter(q.family for q in walker_pick)) if walker else {},
+                extraction=extraction,
                 walker_errors=getattr(walker, "errors", 0) if walker else 0)
 
 # ----------------------------------------------------------------------------------

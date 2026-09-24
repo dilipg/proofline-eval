@@ -61,3 +61,67 @@ def test_b5_walks_an_extraction(ingested):
             for t in ("entities", "mentions", "extracted_cards"):
                 cur.execute(f"DELETE FROM {t} WHERE source='test:truth'")
         pe._INDEX_CACHE.clear()
+
+
+def _truth_extraction(store, fraction=1.0):
+    with store.conn.cursor() as cur:
+        for t in ("entities", "mentions", "extracted_cards"):
+            cur.execute(f"DELETE FROM {t} WHERE source='test:truth'")
+        cur.execute("INSERT INTO entities SELECT id, name, kind, 'test:truth' FROM true_entities")
+        cur.execute("INSERT INTO mentions SELECT card_id, entity_id, surface, role, 'test:truth' FROM true_mentions")
+        cur.execute("INSERT INTO extracted_cards SELECT id, 'test:truth' FROM cards ORDER BY id "
+                    "LIMIT (SELECT ceil(count(*) * %s) FROM cards)", (fraction,))
+    pe._INDEX_CACHE.clear()
+
+
+def _clear_truth_extraction(store):
+    with store.conn.cursor() as cur:
+        for t in ("entities", "mentions", "extracted_cards"):
+            cur.execute(f"DELETE FROM {t} WHERE source='test:truth'")
+    pe._INDEX_CACHE.clear()
+
+
+def test_b5_reports_extraction_coverage(ingested):
+    store, emb = ingested
+    try:
+        _truth_extraction(store, 1.0)
+        full = pe.branch5_multihop(store, pe.Config(profile="smoke", extractor="test:truth"), emb, _NoTrace())
+        assert full["extraction"]["coverage"] == 1.0 and not full["extraction"]["partial"]
+        _truth_extraction(store, 0.5)
+        half = pe.branch5_multihop(store, pe.Config(profile="smoke", extractor="test:truth"), emb, _NoTrace())
+        assert half["extraction"]["partial"] and half["extraction"]["coverage"] < 0.6
+    finally:
+        _clear_truth_extraction(store)
+
+
+def test_b5_refuses_circular_scorers(ingested, monkeypatch):
+    store, emb = ingested
+    monkeypatch.setattr(pe, "ONTOLOGY_DERIVED_LABELS", {"multihop"})
+    try:
+        _truth_extraction(store, 1.0)
+        out = pe.branch5_multihop(store, pe.Config(profile="smoke", extractor="test:truth"), emb, _NoTrace())
+        assert out["skipped"]["onto_walk"].startswith("REFUSED")
+        assert "onto_walk" not in out["scorers"]
+    finally:
+        _clear_truth_extraction(store)
+
+
+def test_b5_does_not_report_a_walker_that_failed(ingested, monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    store, emb = ingested
+
+    class _Down:
+        def create(self, **kw):
+            raise RuntimeError("no credentials")
+
+    monkeypatch.setattr(pe, "make_walker", lambda spec: pe.AnthropicWalker(
+        "m", client=SimpleNamespace(messages=_Down()), cache_path=tmp_path / "llm.sqlite"))
+    try:
+        _truth_extraction(store, 1.0)
+        out = pe.branch5_multihop(store, pe.Config(profile="smoke", extractor="test:truth",
+                                                   walker="anthropic:m", llm_queries=6), emb, _NoTrace())
+        assert out["skipped"]["onto_llm_walk"].startswith("NOT MEASURED")
+        assert "onto_llm_walk" not in out["scorers"]
+        assert not any("onto_llm_walk" in (c["a"], c["b"]) for c in out["comparisons"])
+    finally:
+        _clear_truth_extraction(store)

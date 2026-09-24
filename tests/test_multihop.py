@@ -97,3 +97,24 @@ def test_entities_off_builds_no_multihop():
     cfg = pe.Config(profile="smoke", entities=False)
     c = pe.build_corpus(cfg, cfg.p["cards"], cfg.p["prooflines"])
     assert "multihop" not in c.queries
+
+
+def test_no_aggregate_set_is_answerable_from_one_card(quick):
+    # the introducing card lists datasets outright; it must never list the WHOLE gold set
+    name = {e[0]: e[1] for e in quick.entities}
+    succ = {c.supersedes_id: c for c in quick.cards if c.supersedes_id}
+    valid = lambda c, t: c.committed_at <= t and (c.id not in succ or succ[c.id].committed_at > t)
+    for q in mh(quick):
+        if q.family != "aggregate_set":
+            continue
+        gold = set(q.answer["set"])
+        a_card = next(c for c in quick.cards if c.id in q.slots[0])
+        asked = {e for e, _s, role in a_card.true_mentions if role == "uses"}   # "the method used here"
+        for c in quick.cards:
+            if not valid(c, q.as_of):
+                continue
+            by_subj = defaultdict(set)
+            for s, r, o, _v in c.true_facts:
+                if r in ("evaluated_on", "reports"):
+                    by_subj[s].add(name[o])
+            assert not any(gold <= ds for m, ds in by_subj.items() if m in asked), (q.id, c.id)

@@ -60,3 +60,20 @@ def test_anthropic_walker_filters_and_counts_bad_replies(tmp_path):
 def test_make_walker_parses_the_spec():
     assert isinstance(pe.make_walker("mock"), pe.MockWalker)
     assert pe.make_walker("anthropic:claude-haiku-4-5").model == "claude-haiku-4-5"
+
+
+def test_anthropic_walker_needs_a_key_from_the_environment(monkeypatch):
+    # the SDK only fails at request time; a walker that never ran must not print a verdict
+    import pytest
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    with pytest.raises(SystemExit, match="ANTHROPIC_API_KEY"):
+        pe.make_walker("anthropic:claude-haiku-4-5")
+
+
+def test_cache_key_covers_the_system_prompt_and_schema(tmp_path, monkeypatch):
+    w = pe.AnthropicWalker("claude-haiku-4-5", client=SimpleNamespace(messages=None),
+                           cache_path=tmp_path / "llm.sqlite")
+    k = w.cache_key("same prompt")
+    monkeypatch.setattr(pe, "WALK_SYSTEM", pe.WALK_SYSTEM + " (edited)")
+    assert w.cache_key("same prompt") != k
