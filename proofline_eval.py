@@ -1869,6 +1869,7 @@ class Index:
         self.graph: dict[str, list[str]] = {}
         self._cite_ts: dict[str, np.ndarray] = {}
         self.cited_by: dict[str, list[tuple[str, float]]] = {}
+        self.onto: Optional["OntologyIndex"] = None
 
     def attach_graph(self, edges: Sequence[tuple[str, str, datetime]]) -> None:
         """`edges` are (src, dst, valid_from). In-degree is counted AS OF a query time: a
@@ -1938,6 +1939,54 @@ class Index:
         return self.emb @ qvec.astype(np.float32)
 
 
+class OntologyIndex:
+    """Cards and extracted entities as ONE graph, masked per query exactly like the rest
+    of the index. Node i < n is the card idx.ids[i]; node n + j is entity j. Mention
+    edges exist from their card's commit; fact edges carry their validity window."""
+
+    def __init__(self, idx: Index, entities: dict, mentions: Sequence[tuple], facts: Sequence[tuple]):
+        self.n = len(idx.ids)
+        self.ent_ids = sorted(entities)
+        epos = {e: self.n + j for j, e in enumerate(self.ent_ids)}
+        src, dst, t0, t1 = [], [], [], []
+        for cid, eid, _s, _r in mentions:
+            if cid in idx.pos and eid in epos:
+                a, b, t = idx.pos[cid], epos[eid], idx.ts[idx.pos[cid]]
+                src += [a, b]; dst += [b, a]; t0 += [t, t]; t1 += [np.inf, np.inf]
+        for cid, s, _rel, o, _v, vf, vu in facts:
+            if cid in idx.pos and s in epos and o in epos and s != o:
+                a, b = epos[s], epos[o]
+                lo, hi = vf.timestamp(), (vu.timestamp() if vu else np.inf)
+                src += [a, b]; dst += [b, a]; t0 += [lo, lo]; t1 += [hi, hi]
+        self.src, self.dst = np.asarray(src, dtype=np.int64), np.asarray(dst, dtype=np.int64)
+        self.t0, self.t1 = np.asarray(t0, dtype=np.float64), np.asarray(t1, dtype=np.float64)
+        self.size = self.n + len(self.ent_ids)
+
+    def ppr(self, seed: dict[int, float], as_of: datetime, intent: str, card_ok: np.ndarray,
+            iters: int = 20, alpha: float = 0.5) -> np.ndarray:
+        """Personalized PageRank from `seed` over the edges that existed at as_of (for a
+        current-intent question, facts also must not have expired). Masked nodes hold
+        and pass no mass. alpha is HippoRAG's restart weight."""
+        t = as_of.timestamp()
+        ok_edge = (self.t0 <= t) & ((self.t1 > t) if intent == "current" else True)
+        node_ok = np.concatenate([card_ok, np.ones(len(self.ent_ids), dtype=bool)])
+        ok_edge &= node_ok[self.src] & node_ok[self.dst]
+        s, d = self.src[ok_edge], self.dst[ok_edge]
+        deg = np.bincount(s, minlength=self.size).astype(np.float64)
+        w = 1.0 / np.maximum(deg[s], 1.0)
+        p0 = np.zeros(self.size)
+        for i, v in seed.items():
+            if card_ok[i]:
+                p0[i] = v
+        if p0.sum() == 0:
+            return np.zeros(self.n)
+        p0 /= p0.sum()
+        p = p0.copy()
+        for _ in range(iters):
+            p = alpha * p0 + (1 - alpha) * np.bincount(d, weights=p[s] * w, minlength=self.size)
+        return p[:self.n]
+
+
 def rrf(rankings: Sequence[Sequence[int]], k: int = 60) -> dict[int, float]:
     out: dict[int, float] = defaultdict(float)
     for r in rankings:
@@ -1988,6 +2037,7 @@ class Scored:
 class Scorer:
     name = "base"
     uses_graph = False
+    uses_ontology = False
     description = ""
 
     def prepare(self, idx: Index, embedder: Embedder) -> None:
@@ -2195,13 +2245,34 @@ class DagWalk(Scorer):
                                 max(fs.values(), default=0.0))
 
 
+class OntoWalk(Scorer):
+    """The ontology method: Personalized PageRank from the first stage's top 10 over
+    cards + extracted entities, masked at as_of. Reaches a card that shares an entity
+    with the question's subject and nothing else."""
+    name = "onto_walk"
+    uses_ontology = True
+    description = "PPR over the as-of-masked card-entity graph from the extraction."
+
+    def run(self, q, k):
+        if self.idx.onto is None:
+            raise RuntimeError("onto_walk needs an extraction: run ingest_semantica.py")
+        ok = pool(self.idx, q)
+        fs = first_stage(self.idx, self.embedder, q)
+        seed = {i: fs[i] for i in ranked_ids(fs)[:10]}
+        p = self.idx.onto.ppr(seed, q.as_of, q.intent, self.idx.snapshot_mask(q.as_of))
+        scores = {int(i): float(p[i]) for i in np.nonzero(p > 0)[0] if ok[i]}
+        return self._emit_chain(scores, k, max(fs.values(), default=0.0))
+
+
 SCORERS: dict[str, type[Scorer]] = {c.name: c for c in
                                     [BM25Scorer, DenseScorer, HybridRRF,
                                      HybridFresh, GraphBoost, CrossEncoderRerank,
-                                     TwoStep, DagWalk]}
+                                     TwoStep, DagWalk, OntoWalk]}
 
 # label sources that are derived from the record's link structure
 GRAPH_DERIVED_LABELS = {"dag_mined"}
+# label sources composed from an EXTRACTION: none yet (arXiv gold would be one)
+ONTOLOGY_DERIVED_LABELS: set[str] = set()
 
 
 def check_circularity(scorer: Scorer, label_src: str) -> Optional[str]:
@@ -2209,6 +2280,9 @@ def check_circularity(scorer: Scorer, label_src: str) -> Optional[str]:
         return (f"REFUSED: scorer '{scorer.name}' reads graph structure and labels "
                 f"'{label_src}' are derived from it. The comparison would score the "
                 f"scorer on its own feature.")
+    if getattr(scorer, "uses_ontology", False) and label_src in ONTOLOGY_DERIVED_LABELS:
+        return (f"REFUSED: scorer '{scorer.name}' walks the extracted ontology and labels "
+                f"'{label_src}' were composed from it.")
     return None
 
 
@@ -2812,14 +2886,14 @@ _INDEX_CACHE: dict[Any, Index] = {}
 
 
 def build_index(store: Store, n_limit: Optional[int],
-                keep: Optional[frozenset] = None) -> Index:
+                keep: Optional[frozenset] = None, extractor: Optional[str] = None) -> Index:
     """One index over the whole record; snapshots are applied as a mask at query time.
 
     `n_limit` sets the corpus size for a B3 scale point; `keep` names the cards that
     must survive the sampling (every judged document), so growing the corpus adds
     distractors rather than removing answers.
     """
-    key = ("idx", n_limit, keep)
+    key = ("idx", n_limit, keep, extractor)
     hit = _INDEX_CACHE.get(key)
     if hit is not None:
         return hit
@@ -2828,16 +2902,36 @@ def build_index(store: Store, n_limit: Optional[int],
     with store.conn.cursor() as cur:
         cur.execute("SELECT src, dst, valid_from FROM edges WHERE kind IN ('parent','citation')")
         edges = [(r["src"], r["dst"], r["valid_from"]) for r in cur.fetchall()]
-    idx.attach_graph(edges)
+        idx.attach_graph(edges)
+        if extractor:
+            cur.execute("SELECT id, name, kind FROM entities WHERE source = %s", (extractor,))
+            ents = {r["id"]: (r["name"], r["kind"]) for r in cur.fetchall()}
+            if ents:
+                cur.execute("SELECT card_id, entity_id, surface, role FROM mentions "
+                            "WHERE source = %s", (extractor,))
+                ments = [tuple(r.values()) for r in cur.fetchall()]
+                cur.execute("SELECT card_id, subj, rel, obj, value, valid_from, valid_until "
+                            "FROM facts WHERE source = %s", (extractor,))
+                facts = [tuple(r.values()) for r in cur.fetchall()]
+                idx.onto = OntologyIndex(idx, ents, ments, facts)
     _INDEX_CACHE[key] = idx
     return idx
+
+
+def extraction_available(store: Store, extractor: Optional[str]) -> bool:
+    if not extractor:
+        return False
+    with store.conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM entities WHERE source = %s LIMIT 1", (extractor,))
+        return cur.fetchone() is not None
 
 
 def execute_run(store: Store, scorer: Scorer, embedder: Embedder,
                 queries: Sequence[Query], label_src: str, corpus_n: Optional[int],
                 k: int, tracer: Tracer,
                 threshold: Optional[float] = None,
-                keep: Optional[frozenset] = None) -> RunResult:
+                keep: Optional[frozenset] = None,
+                extractor: Optional[str] = None) -> RunResult:
     """One scorer over one query set.
 
     The index covers the whole record; each query is restricted to the corpus as it
@@ -2854,7 +2948,7 @@ def execute_run(store: Store, scorer: Scorer, embedder: Embedder,
         tops: dict[str, float] = {}
         chains: dict[str, list[str]] = {}
         if queries:
-            idx = build_index(store, corpus_n, keep)
+            idx = build_index(store, corpus_n, keep, extractor)
             scorer.prepare(idx, embedder)
             for q in queries:
                 out = scorer.run(q, k)
