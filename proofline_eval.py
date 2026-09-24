@@ -1556,6 +1556,14 @@ class Index:
                 self.superseded_by[r["supersedes_id"]] = cid
         self.is_current = {cid: bool(r["is_current"]) for cid, r in rows.items()}
         self.current_mask = np.array([bool(rows[c]["is_current"]) for c in self.ids])
+        # When each card stopped being current: its successor's commit, or never. The
+        # end-of-record `current_mask` answers "current today", which no query may ask.
+        self.superseded_ts = np.full(len(self.ids), np.inf)
+        for cid, r in rows.items():
+            sup = r["supersedes_id"]
+            if sup and sup in self.pos:
+                j = self.pos[sup]
+                self.superseded_ts[j] = min(self.superseded_ts[j], r["committed_at"].timestamp())
         self.ts = np.array([rows[c]["committed_at"].timestamp() for c in self.ids],
                            dtype=np.float64)
         self._mask_cache: dict[float, np.ndarray] = {}
@@ -1597,6 +1605,12 @@ class Index:
                 self._mask_cache.clear()
             self._mask_cache[k] = m
         return m
+
+    def current_at(self, as_of: datetime) -> np.ndarray:
+        """Cards not yet superseded at `as_of`. A card revised AFTER the query's date was
+        the current version when the question was asked; filtering it on today's
+        `current_mask` drops it while its successor is still masked out as unwritten."""
+        return self.superseded_ts > as_of.timestamp()
 
     def age_days_at(self, as_of: datetime) -> np.ndarray:
         return np.maximum(0.0, (as_of.timestamp() - self.ts) / 86400.0)
@@ -1723,9 +1737,10 @@ class HybridFresh(Scorer):
         den = self._mask(self.idx.cosine(self.embedder.encode_queries([q.text])[0]), m)
         fused = rrf([topn(lex, 150), topn(den, 150)])
         age = self.idx.age_days_at(q.as_of)
+        cur = self.idx.current_at(q.as_of)
         s = np.zeros(len(self.idx.ids), dtype=np.float32)
         for i, v in fused.items():
-            if not m[i] or not self.idx.current_mask[i]:
+            if not m[i] or not cur[i]:
                 continue                       # filtered, not down-weighted
             s[i] = v / (1.0 + 0.0006 * float(age[i]))
         return self._emit(topn(s, k), s, k)
@@ -1785,8 +1800,9 @@ class CrossEncoderRerank(Scorer):
         lex = self._mask(self.idx.bm25(q.text), m)
         den = self._mask(self.idx.cosine(self.embedder.encode_queries([q.text])[0]), m)
         fused = rrf([topn(lex, 150), topn(den, 150)])
+        cur = self.idx.current_at(q.as_of)
         cand = [i for i, _ in sorted(fused.items(), key=lambda kv: -kv[1])
-                if m[i] and self.idx.current_mask[i]][:self.CAND]
+                if m[i] and cur[i]][:self.CAND]
         if not cand:
             return Scored([], [], 0.0)
         pairs = [(q.text, self.idx.rows[self.idx.ids[i]]["txt"][:1200]) for i in cand]
