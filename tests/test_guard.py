@@ -31,11 +31,13 @@ def test_assert_no_truth_leak_runs_on_this_platform():
 
 def test_pgserver_marker_covers_every_platform_with_a_wheel():
     from packaging.markers import Marker
-    deps = [ln for ln in SRC.splitlines()[:15] if "pgserver" in ln]
-    marker = Marker(deps[0].split(";", 1)[1].strip().rstrip('",'))
-    for plat, machine in (("win32", "AMD64"), ("linux", "x86_64"), ("darwin", "arm64")):
-        assert marker.evaluate({"sys_platform": plat, "platform_machine": machine}), (plat, machine)
-    assert not marker.evaluate({"sys_platform": "linux", "platform_machine": "aarch64"})
+    for script in ("proofline_eval.py", "ingest_semantica.py"):
+        head = (Path(pe.__file__).parent / script).read_text(encoding="utf-8").splitlines()[:15]
+        deps = [ln for ln in head if "pgserver" in ln]
+        marker = Marker(deps[0].split(";", 1)[1].strip().rstrip('",'))
+        for plat, machine in (("win32", "AMD64"), ("linux", "x86_64"), ("darwin", "arm64")):
+            assert marker.evaluate({"sys_platform": plat, "platform_machine": machine}), (script, plat)
+        assert not marker.evaluate({"sys_platform": "linux", "platform_machine": "aarch64"})
 
 
 def test_cli_prints_through_a_pipe():
