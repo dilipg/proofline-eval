@@ -1124,6 +1124,33 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS edges_dst ON edges (dst, kind);
 
+-- PLANTED entity layer. Truth, like true_support: B1 grades extractors against it and
+-- nothing on the retrieval path may read it (assert_no_truth_leak).
+CREATE TABLE IF NOT EXISTS true_entities (
+  id text PRIMARY KEY, name text NOT NULL, kind text NOT NULL, parent_kind text);
+CREATE TABLE IF NOT EXISTS true_mentions (
+  card_id text NOT NULL, entity_id text NOT NULL, surface text NOT NULL, role text NOT NULL);
+CREATE TABLE IF NOT EXISTS true_facts (
+  card_id text NOT NULL, subj text NOT NULL, rel text NOT NULL, obj text NOT NULL, value text);
+
+-- EXTRACTED, written by ingest_semantica.py. `source` names the extractor
+-- ('semantica:regex', 'semantica:llm:anthropic:claude-haiku-4-5'); several coexist.
+CREATE TABLE IF NOT EXISTS entities (
+  id text NOT NULL, name text NOT NULL, kind text NOT NULL, source text NOT NULL,
+  PRIMARY KEY (id, source));
+CREATE TABLE IF NOT EXISTS mentions (
+  card_id text NOT NULL, entity_id text NOT NULL, surface text NOT NULL,
+  role text NOT NULL, source text NOT NULL);
+CREATE INDEX IF NOT EXISTS mentions_card ON mentions (source, card_id);
+CREATE TABLE IF NOT EXISTS facts (
+  card_id text NOT NULL, subj text NOT NULL, rel text NOT NULL, obj text NOT NULL,
+  value text, source text NOT NULL,
+  valid_from timestamptz NOT NULL, valid_until timestamptz);    -- NULL = still valid
+CREATE TABLE IF NOT EXISTS onto_classes (source text NOT NULL, class text NOT NULL, parent text);
+-- which cards an extractor actually read: B1 grades only those
+CREATE TABLE IF NOT EXISTS extracted_cards (
+  card_id text NOT NULL, source text NOT NULL, PRIMARY KEY (card_id, source));
+
 CREATE TABLE IF NOT EXISTS queries (
   id          text PRIMARY KEY,
   provenance  text NOT NULL,
@@ -1225,8 +1252,9 @@ class Store:
     def init(self, *, reset: bool = False) -> None:
         with self.conn.cursor() as cur:
             if reset:
-                cur.execute("DROP TABLE IF EXISTS metrics, results, runs, qrels, "
-                            "queries, edges, cards CASCADE;")
+                cur.execute("DROP TABLE IF EXISTS metrics, results, runs, qrels, queries, "
+                            "edges, cards, true_entities, true_mentions, true_facts, "
+                            "entities, mentions, facts, onto_classes, extracted_cards CASCADE;")
             cur.execute(SCHEMA)
 
     def load_corpus(self, corpus: Corpus) -> None:
@@ -1245,6 +1273,17 @@ class Store:
             with cur.copy("COPY edges (src,dst,kind,valid_from) FROM STDIN") as cp:
                 for r in edge_rows:
                     cp.write_row(r)
+            with cur.copy("COPY true_entities (id,name,kind,parent_kind) FROM STDIN") as cp:
+                for e in corpus.entities:
+                    cp.write_row(e)
+            with cur.copy("COPY true_mentions (card_id,entity_id,surface,role) FROM STDIN") as cp:
+                for c in corpus.cards:
+                    for eid, surface, role in c.true_mentions:
+                        cp.write_row((c.id, eid, surface, role))
+            with cur.copy("COPY true_facts (card_id,subj,rel,obj,value) FROM STDIN") as cp:
+                for c in corpus.cards:
+                    for s, r, o, v in c.true_facts:
+                        cp.write_row((c.id, s, r, o, v))
             with cur.copy(
                 "COPY queries (id,provenance,text,as_of,source_card,answerable,slices) "
                 "FROM STDIN"
@@ -3226,6 +3265,7 @@ scorers: """ + ", ".join(SCORERS) + """
             # A DB seeded before edges carried valid_from is an older schema, not a
             # corpus: re-seed it rather than half-read it.
             cur.execute("SELECT valid_from FROM edges LIMIT 0")
+            cur.execute("SELECT 1 FROM true_mentions LIMIT 0")
             n_cards, n_emb, compatible = r["n"], r["e"], True
         except psycopg.Error:
             # a table left over from an older schema is not a corpus; start clean
