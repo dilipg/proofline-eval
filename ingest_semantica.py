@@ -36,10 +36,10 @@ import sqlite3
 import sys
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -333,6 +333,88 @@ def priority_cards(store: pe.Store) -> set[str]:
         return {r["card_id"] for r in cur.fetchall()}
 
 
+# ---- visualization: pure graph builders --------------------------------------------
+
+def parse_asofs(spec: Optional[str]) -> list[datetime]:
+    out = []
+    for s in (spec or "").split(","):
+        if s.strip():
+            d = datetime.fromisoformat(s.strip())
+            out.append(d if d.tzinfo else d.replace(tzinfo=timezone.utc))
+    return out
+
+
+def bfs_sample(adj: dict[str, set[str]], seeds: Sequence[str], limit: int,
+               allowed: Callable[[str], bool]) -> list[str]:
+    seen, order = set(), []
+    q = deque(s for s in seeds if allowed(s))
+    while q and len(order) < limit:
+        n = q.popleft()
+        if n in seen:
+            continue
+        seen.add(n)
+        order.append(n)
+        q.extend(m for m in sorted(adj.get(n, ())) if m not in seen and allowed(m))
+    return order
+
+
+def resolve_seed(cards: dict[str, dict], seed: Optional[str], live: set[str],
+                 degree: Callable[[str], int]) -> Optional[str]:
+    """A card id, a proofline id (its earliest live card), or, when unset, the busiest card."""
+    if seed in live:
+        return seed
+    if seed:
+        line = sorted((cards[c]["committed_at"], c) for c in live if cards[c]["proofline_id"] == seed)
+        return line[0][1] if line else None
+    return max(sorted(live), key=degree, default=None)
+
+
+def dag_graph(cards: dict[str, dict], edges: Sequence[tuple], asof: datetime,
+              seed: Optional[str], limit: int) -> dict:
+    """Cards and their citation/parent edges as the record stood at `asof`. A card is
+    drawn superseded only if its successor existed by then."""
+    live = {c for c, r in cards.items() if r["committed_at"] <= asof}
+    adj: dict[str, set[str]] = defaultdict(set)
+    valid = [(s, d, k, vf) for s, d, k, vf in edges if vf <= asof and s in live and d in live]
+    for s, d, _k, _vf in valid:
+        adj[s].add(d)
+        adj[d].add(s)
+    start = resolve_seed(cards, seed, live, lambda c: len(adj[c]))
+    nodes = bfs_sample(adj, [start] if start else [], limit, live.__contains__)
+    keep = set(nodes)
+    superseded = {r["supersedes_id"] for c, r in cards.items() if r["supersedes_id"] and c in live}
+    return {"entities": [{"id": c, "type": "superseded" if c in superseded else "current",
+                          "name": cards[c]["title"][:60]} for c in nodes],
+            "relationships": [{"source": s, "target": d, "type": k, "valid_from": vf, "valid_until": None}
+                              for s, d, k, vf in valid if s in keep and d in keep]}
+
+
+def ontology_graph(cards: dict[str, dict], ents: dict[str, tuple], ments: Sequence[tuple],
+                   facts: Sequence[tuple], asof: datetime, seed: Optional[str], limit: int) -> dict:
+    """Cards, the entities they mention and the typed facts between entities, as of
+    `asof`. A fact from a card that was superseded by then has expired."""
+    live = {c for c, r in cards.items() if r["committed_at"] <= asof}
+    adj: dict[str, set[str]] = defaultdict(set)
+    medges, fedges = [], []
+    for c, e, _s, role in ments:
+        if c in live and e in ents:
+            adj[c].add(e)
+            adj[e].add(c)
+            medges.append((c, e, role, cards[c]["committed_at"], None))
+    for c, s, rel, o, v, vf, vu in facts:
+        if c in live and vf <= asof and (vu is None or vu > asof) and s in ents and o in ents:
+            adj[s].add(o)
+            adj[o].add(s)
+            fedges.append((s, o, rel if v is None else f"{rel} {v}", vf, vu))
+    start = resolve_seed(cards, seed, live, lambda c: len(adj[c]))
+    nodes = bfs_sample(adj, [start] if start else [], limit, lambda n: n in live or n in ents)
+    keep = set(nodes)
+    return {"entities": [{"id": n, "type": "Card", "name": cards[n]["title"][:60]} if n in cards
+                         else {"id": n, "type": ents[n][1], "name": ents[n][0]} for n in nodes],
+            "relationships": [{"source": s, "target": o, "type": t, "valid_from": vf, "valid_until": vu}
+                              for s, o, t, vf, vu in medges + fedges if s in keep and o in keep]}
+
+
 # ---- the only place Semantica is called ------------------------------------------
 
 class SemanticaAdapter:
@@ -400,6 +482,38 @@ class SemanticaAdapter:
             min_occurrences=2)
 
 
+    @staticmethod
+    def _slim(graph: dict) -> dict:
+        return {"entities": graph["entities"],
+                "relationships": [{k: e[k] for k in ("source", "target", "type")}
+                                  for e in graph["relationships"]]}
+
+    def draw_network(self, graph: dict, path: Path) -> None:
+        from semantica.visualization import KGVisualizer
+        KGVisualizer().visualize_network(self._slim(graph), output="html", file_path=str(path))
+
+    def draw_hierarchy(self, onto: dict, path: Path) -> None:
+        from semantica.visualization import OntologyVisualizer
+        OntologyVisualizer().visualize_hierarchy(onto, output="html", file_path=str(path))
+
+    def draw_snapshots(self, snaps: dict[str, dict], path: Path) -> None:
+        from semantica.visualization import TemporalVisualizer
+        TemporalVisualizer().visualize_snapshot_comparison(
+            {k: self._slim(g) for k, g in snaps.items()}, output="html", file_path=str(path))
+
+    def save_context_graph(self, graph: dict, first_seen: dict[str, datetime], path: Path) -> None:
+        """The explorer's own format (`semantica-explorer --graph <path>`), with validity
+        times on nodes and edges so its temporal view works."""
+        from semantica.context import ContextGraph
+        cg = ContextGraph()
+        for n in graph["entities"]:
+            extra = {"valid_from": first_seen[n["id"]].isoformat()} if n["id"] in first_seen else {}
+            cg.add_node(n["id"], n["type"], content=n["name"], **extra)
+        for e in graph["relationships"]:
+            extra = {k: e[k].isoformat() for k in ("valid_from", "valid_until") if e.get(k)}
+            cg.add_edge(e["source"], e["target"], edge_type=e["type"], **extra)
+        cg.save_to_file(str(path), format="json")
+
 # ---- the run ---------------------------------------------------------------------
 
 def run_extraction(store: pe.Store, rows: list[dict], a: argparse.Namespace, source: str) -> None:
@@ -458,6 +572,65 @@ def run_extraction(store: pe.Store, rows: list[dict], a: argparse.Namespace, sou
            f"in {time.time() - t0:.0f}s  [source={source}]")
 
 
+def render_viz(store: pe.Store, rows: list[dict], a: argparse.Namespace, source: str) -> None:
+    out = pe.STATE_DIR / "viz"
+    out.mkdir(parents=True, exist_ok=True)
+    cards = {r["id"]: r for r in rows}
+    with store.conn.cursor() as cur:
+        cur.execute("SELECT src, dst, kind, valid_from FROM edges WHERE kind IN ('parent','citation')")
+        edges = [(r["src"], r["dst"], r["kind"], r["valid_from"]) for r in cur.fetchall()]
+        cur.execute("SELECT id, name, kind FROM entities WHERE source = %s", (source,))
+        ents = {r["id"]: (r["name"], r["kind"]) for r in cur.fetchall()}
+        cur.execute("SELECT card_id, entity_id, surface, role FROM mentions WHERE source = %s", (source,))
+        ments = [tuple(r.values()) for r in cur.fetchall()]
+        cur.execute("SELECT card_id, subj, rel, obj, value, valid_from, valid_until FROM facts "
+                    "WHERE source = %s", (source,))
+        facts = [tuple(r.values()) for r in cur.fetchall()]
+        cur.execute("SELECT DISTINCT source FROM extracted_cards ORDER BY source")
+        have = [r["source"] for r in cur.fetchall()]
+    stamps = sorted(r["committed_at"] for r in rows)
+    asofs = sorted(parse_asofs(a.viz_asof) or [stamps[len(stamps) // 2], stamps[-1]])
+    latest = asofs[-1]
+    adapter = SemanticaAdapter(a.method, None)
+    pe.log(f"drawing {source} as of {', '.join(d.date().isoformat() for d in asofs)} into {out}")
+
+    def draw(name: str, graph: dict, fn: Callable) -> None:
+        if not graph["entities"]:
+            pe.log(f"  skipped {name}: nothing in the snapshot at {latest.date()} (seed not written yet?)")
+            return
+        fn(graph, out / name)
+        pe.log(f"  wrote {name}  ({len(graph['entities'])} nodes, {len(graph['relationships'])} edges)")
+
+    draw("dag.html", dag_graph(cards, edges, latest, a.viz_seed, a.viz_sample), adapter.draw_network)
+    if not ents:
+        pe.log(f"  no extraction for {source} (have: {', '.join(have) or 'none'}); only dag.html drawn")
+        return
+    onto_g = ontology_graph(cards, ents, ments, facts, latest, a.viz_seed, a.viz_sample)
+    draw("ontology.html", onto_g, adapter.draw_network)
+    snaps = {d.date().isoformat(): ontology_graph(cards, ents, ments, facts, d, a.viz_seed, a.viz_sample)
+             for d in asofs}
+    snaps = {k: g for k, g in snaps.items() if g["entities"]}
+    if snaps:
+        adapter.draw_snapshots(snaps, out / "timeline.html")
+        pe.log(f"  wrote timeline.html  ({len(snaps)} snapshots)")
+    else:
+        pe.log("  skipped timeline.html: every snapshot is empty")
+    onto_path = out / f"ontology-{safe(source)}.json"
+    onto = json.loads(onto_path.read_text(encoding="utf-8")) if onto_path.exists() else {}
+    if onto.get("classes"):
+        adapter.draw_hierarchy(onto, out / "ontology-classes.html")
+        pe.log(f"  wrote ontology-classes.html  ({len(onto['classes'])} classes)")
+    else:
+        pe.log("  skipped ontology-classes.html: Semantica inferred no classes for this extraction")
+    first_seen = {c: r["committed_at"] for c, r in cards.items()}
+    for c, e, _s, _r in ments:
+        t = cards[c]["committed_at"]
+        first_seen[e] = min(first_seen.get(e, t), t)
+    if onto_g["entities"]:
+        adapter.save_context_graph(onto_g, first_seen, out / "graph.json")
+        pe.log(f"  wrote graph.json  (open with: semantica-explorer --graph {out / 'graph.json'})")
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="ingest_semantica.py",
                                  description="Ontology ingestion with Semantica.")
@@ -467,6 +640,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--extract-limit", type=int, default=None,
                     help="cards to read (default: all for regex, 300 for llm; 0 = all)")
     ap.add_argument("--workers", type=int, default=8, help="parallel LLM calls")
+    ap.add_argument("--viz", action="store_true", help="draw after extracting")
+    ap.add_argument("--viz-only", action="store_true", help="draw an existing extraction; read nothing")
+    ap.add_argument("--viz-source", default=None,
+                    help="extractor id to draw (default: the one --method/--llm name)")
+    ap.add_argument("--viz-seed", default=None, help="card id or proofline id to centre on")
+    ap.add_argument("--viz-sample", type=int, default=400, help="max nodes per picture")
+    ap.add_argument("--viz-asof", default=None,
+                    help="comma-separated dates (default: the median and latest commit)")
     ap.add_argument("--database-url", default=None)
     return ap
 
@@ -480,7 +661,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     rows = fetch_cards(store)
     if not rows:
         raise SystemExit("no cards in the database; run `uv run proofline_eval.py seed` first")
-    run_extraction(store, rows, a, source_id(a.method, a.llm if a.method == "llm" else None))
+    source = source_id(a.method, a.llm if a.method == "llm" else None)
+    if not a.viz_only:
+        run_extraction(store, rows, a, source)
+    if a.viz or a.viz_only:
+        render_viz(store, rows, a, a.viz_source or source)
     store.close()
     return 0
 
