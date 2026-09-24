@@ -21,6 +21,7 @@ uv run proofline_eval.py all --profile quick     # ~7s,  2500 cards, the default
 uv run proofline_eval.py all --profile full      # ~50s, 12000 cards, 3 scale points
 
 uv run proofline_eval.py b1                      # one branch, reusing seeded data
+uv run proofline_eval.py b5                      # multi-hop: DAG vs ontology vs query-side
 uv run proofline_eval.py scorers                 # registry: scorers + label sources
 uv run proofline_eval.py reset                   # DROP the tables
 uv run proofline_eval.py seed | ingest           # stages, run separately
@@ -78,7 +79,8 @@ Sections are numbered `§0`–`§12` in comment banners; grep those to navigate.
 §8  Judges      MockJudge (simulator w/ injected bias) | HTTPJudge (openai/anthropic)
 §9  Tracing     Tracer, Langfuse shim, no-ops without keys, survives v2/v3 split
 §10 Harness     execute_run → score_runs (pooled) → paired; hard_checks
-§11 Branches    branch1_labels .. branch4_loop, one per experiment; extraction_block (B1)
+§11 Branches    branch1_labels .. branch5_multihop, one per experiment; extraction_block (B1),
+                filter_disconnected (run by ingest)
 §12 CLI         cmd_seed, cmd_ingest, write_report, main
 ```
 
@@ -105,7 +107,8 @@ Breaking one of these silently invalidates every number downstream.
 4. **Every query is answered against its own `as_of` snapshot**, applied as
    `idx.snapshot_mask(q.as_of)` inside the scorer. A scorer that skips the mask will
    score well and be wrong. Never rebuild the index per timestamp (that was the 2-minute
-   bug; see HARNESS-NOTES).
+   bug; see HARNESS-NOTES). "Current" means current at `q.as_of` (`idx.current_at`);
+   `current_mask` is the end of the record and is never used to filter.
 5. **Scale points pin the needles.** `build_index(store, n_limit, keep)` passes `keep` =
    every judged card into `Store.subset()`, so growing the corpus adds distractors
    instead of deleting answers.
@@ -166,6 +169,10 @@ RESULTS.html          findings from the full four-branch run on 60k arXiv cards
   implement `run(q, k)` starting from `self.idx.snapshot_mask(q.as_of)`, then append the
   class to the list literal building `SCORERS`. `--baseline`/`--candidate` choices derive
   from that dict, so nothing else needs touching.
+- **New multi-hop scorer**: start from `first_stage(idx, embedder, q)` (as-of and intent
+  aware via `pool()`), and emit through `Scorer._emit_hops(first_stage, second_hop, k)`.
+  Fusing the second hop into one ranked list lets the ten seeds fill the top ten; measured,
+  that zeroed chain_recall for every method.
 - **New CLI flag**: `argparse` in `main()` *and* the `Config` field *and* the `Config(...)`
   construction, three places, all in one screen. Current additions beyond the original
   set: `--source`, `--eval-provenance`, `--max-eval-queries`, `--scale-judged-budget`.

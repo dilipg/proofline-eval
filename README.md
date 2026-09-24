@@ -198,6 +198,33 @@ synthetic report against one from before it.
 
 ---
 
+## Multi-hop retrieval (B5)
+
+The synthetic corpus also plants multi-hop questions composed from the entity layer:
+`bridge` (question → the card that uses a method → the card that reports it),
+`bridge3` (one more hop through `extends`), `chrono_asof` (the same question either
+side of a change), `timeline`, `history` (the versions before a revision, which asks
+for superseded cards on purpose), `aggregate_set` and `aggregate_count`, plus no-answer
+twins. None names the bridge entity, and `ingest` drops any question a single hop can
+answer (MuSiQue's disconnection filter), with its pair.
+
+    uv run proofline_eval.py b5                                   # mock walker, regex extraction
+    uv run proofline_eval.py b5 --extractor semantica:llm:anthropic:claude-haiku-4-5 \
+        --walker anthropic:claude-haiku-4-5 --llm-queries 40
+
+B5 compares `dag_walk` (citation edges), `onto_walk` (Personalized PageRank over the
+extracted ontology) and `onto_llm_walk` (an LLM chooses each hop) against the
+query-side control `two_step` and the reference `hybrid_rrf_fresh`, paired on
+chain_recall: a question counts only when every hop's evidence is in the top k. A
+gold-chain oracle row must read 1.000; anything less is a harness bug.
+
+Every multi-hop scorer spends its top k on both hops: the first stage's best half, then
+what the second hop discovered. Fused into one ranked list instead, the first stage's
+seeds fill the top ten and the second hop's find ranks eleventh; measured, that sent
+every method's chain_recall to zero.
+
+---
+
 ## Scorers
 
 | name | graph? | what it is |
