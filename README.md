@@ -190,7 +190,11 @@ masked at an as-of date, so it shows the record as it stood then:
 - `graph.json`: open with `semantica-explorer --graph .proofline/viz/graph.json`,
   after `pip install "semantica[explorer]"`
 
-`--no-entities` reproduces the pre-ontology corpus byte for byte.
+The entity layer is on by default, so synthetic numbers moved when it landed: on
+`quick`, 136 report fields differ from a pre-ontology run (B4's overall Δ went from
++0.0074 to +0.0037; no verdict or release decision changed). `--no-entities`
+reproduces the pre-ontology corpus byte for byte, and is the only way to compare a
+synthetic report against one from before it.
 
 ---
 

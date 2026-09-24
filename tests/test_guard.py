@@ -21,8 +21,21 @@ def test_guard_ignores_text_outside_the_span():
 
 def test_real_source_is_clean_and_span_covers_scoring():
     assert pe.truth_leak_in(SRC) is None
-    span = SRC.split("# §4  Retrieval index")[1].split("# §11  Branch")[0]
-    assert "class Scorer" in span and "def score_runs" in span
+    span = pe.guarded_span(SRC)
+    # banner LINE to banner LINE: the whole of §4..§10, the guard's own code included
+    for name in ("class Scorer", "def score_runs", "def hard_checks", "def build_index",
+                 "def assert_no_truth_leak"):
+        assert name in span, name
+    assert "def branch1_labels" not in span
+
+
+def test_a_renamed_banner_fails_loudly():
+    # a renamed §11 banner stretches the span into B1's planted reads, which trip it
+    assert pe.truth_leak_in("x\n# §4  Retrieval index\nok\n# §11 Branch\nq = 'true_facts'\n") == "true_facts"
+    # a renamed §4 banner leaves nothing to check: that must stop the run, not pass it
+    import pytest
+    with pytest.raises(SystemExit):
+        pe.truth_leak_in("x\n# §4 Retrieval index\nok\n# §11  Branch\n")
 
 
 def test_assert_no_truth_leak_runs_on_this_platform():

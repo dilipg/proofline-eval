@@ -43,6 +43,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+import psycopg
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import proofline_eval as pe  # noqa: E402
 
@@ -143,9 +145,12 @@ def normalize_card(x: CardExtraction, text: str) -> tuple[list[tuple], list[tupl
         k = entity_key(surface)
         if not k:
             continue
+        # whole-name match: 'Kavrel-7' must not borrow the role of a sentence about
+        # its near-miss sibling 'Kavrel-78'
+        named = re.compile(rf"(?<![A-Za-z0-9]){re.escape(surface)}(?![A-Za-z0-9])")
         role = "mentions"
         for s in sentences:
-            if surface in s:
+            if named.search(s):
                 role = strongest(role, infer_role(s))
         prev = ments.get((k, surface))
         ments[(k, surface)] = (label, strongest(prev[1], role) if prev else role)
@@ -316,6 +321,20 @@ def write_back(store: pe.Store, source: str, card_ids: Sequence[str], entities: 
         with cur.copy("COPY onto_classes (source, class, parent) FROM STDIN") as cp:
             for c, p in classes:
                 cp.write_row((source, c, p))
+
+
+def require_schema(store: pe.Store) -> None:
+    """Stop before any model is billed. A database seeded by pre-P1 code has cards (so
+    reading them works) but none of the tables an extraction writes to, and discovering
+    that at write-back would throw the whole paid run away."""
+    with store.conn.cursor() as cur:
+        try:
+            cur.execute("SELECT 1 FROM extracted_cards LIMIT 0")
+            cur.execute("SELECT valid_from FROM edges LIMIT 0")
+        except psycopg.Error:
+            store.conn.rollback()
+            raise SystemExit("this database predates the entity tables; run "
+                             "`uv run proofline_eval.py seed` first") from None
 
 
 def fetch_cards(store: pe.Store) -> list[dict]:
@@ -658,6 +677,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     store = pe.Store(pe.Config(database_url=a.database_url))
+    require_schema(store)
     rows = fetch_cards(store)
     if not rows:
         raise SystemExit("no cards in the database; run `uv run proofline_eval.py seed` first")

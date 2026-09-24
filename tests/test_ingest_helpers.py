@@ -50,6 +50,24 @@ def test_normalize_card_builds_reports_from_values():
     assert not any(f[1] == "used_for" for f in facts)       # object is not a known entity
 
 
+def test_a_near_miss_sibling_does_not_lend_its_role():
+    # 'Kavrel-7' is a substring of 'Kavrel-78'; its role must come from its own sentence
+    x = ing.CardExtraction("c1", [("Kavrel-7", "KernelMethod"), ("Kavrel-78", "KernelMethod")], [])
+    ments, _f = ing.normalize_card(x, "we introduce Kavrel-78 , a kernel method . we adopt Kavrel-7 here .")
+    assert {s: r for _k, s, _l, r in ments} == {"Kavrel-78": "introduces", "Kavrel-7": "uses"}
+
+
+def test_require_schema_stops_before_billing_on_an_old_database(seeded):
+    ing.require_schema(seeded)                     # a current database passes
+    with seeded.conn.cursor() as cur:
+        cur.execute("DROP TABLE extracted_cards")
+    try:
+        with pytest.raises(SystemExit, match="predates the entity tables"):
+            ing.require_schema(seeded)
+    finally:
+        seeded.init()                              # CREATE IF NOT EXISTS restores it
+
+
 def test_normalize_card_drops_a_value_with_two_datasets():
     x = ing.CardExtraction("c1", [("Kavrel-7", "SamplingMethod"), ("Orvane-QA", "Benchmark"),
                                   ("Dorane-QA", "Benchmark")],

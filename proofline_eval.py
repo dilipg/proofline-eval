@@ -2540,15 +2540,24 @@ def hard_checks(run: RunResult, idx_rows: dict, queries: Sequence[Query],
     }
 
 
-def truth_leak_in(src: str) -> Optional[str]:
-    """The first planted-truth literal on the retrieval/scoring path, or None.
+def guarded_span(src: str) -> str:
+    """The retrieval/scoring path: from the §4 banner LINE to the §11 banner LINE.
 
-    The path runs from the §4 banner to the FIRST occurrence of the §11 banner literal,
-    which is the split call on the next line, so everything below it (including the
-    function that raises) is outside the span it checks. Every planted table is named
-    with the true_ prefix, and none of them may be read from inside the span."""
-    body = src.split("# §4  Retrieval index")[1].split("# §11  Branch")[0]
-    m = re.search(r"\btrue_(?:support|mention|fact|entit)\w*", body)
+    The split strings start with a newline, so they match the banner lines and never
+    these literals, whose source text carries a backslash where the newline would be.
+    A renamed §4 banner stops the run; a renamed §11 banner stretches the span into
+    B1's planted reads, which trip the guard. A broken banner always fails loudly."""
+    _head, found, rest = src.partition("\n# §4  Retrieval index")
+    if not found:
+        raise SystemExit("truth guard: the '# §4  Retrieval index' banner is missing, "
+                         "so there is no span to check")
+    return rest.split("\n# §11  Branch")[0]
+
+
+def truth_leak_in(src: str) -> Optional[str]:
+    """The first planted-truth literal on the retrieval/scoring path, or None. Every
+    planted table is named with the true_ prefix, and none of them may be read there."""
+    m = re.search(r"\btrue_(?:support|mention|fact|entit)\w*", guarded_span(src))
     return m.group(0) if m else None
 
 
@@ -2758,6 +2767,7 @@ _FIDELITY_ROWS = [
     ("untyped_links", "untyped links (count)"),
     ("domain_range_violations", "domain/range violations (count)"),
     ("class_recall", "ontology class recall"), ("subclass_edge_recall", "subclass edge recall"),
+    ("bridges", "bridges graded (count)"),
     ("bridge_coverage", "bridge coverage (both ends extracted)"),
     ("role_accuracy", "role accuracy (cue phrases: template-tuned)"),
 ]

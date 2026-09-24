@@ -71,7 +71,7 @@ def test_extraction_block_not_ingested(seeded, capsys):
     assert "NOT INGESTED" in capsys.readouterr().out
 
 
-def test_extraction_block_grades_a_source(seeded):
+def test_extraction_block_grades_a_source(seeded, capsys):
     with seeded.conn.cursor() as cur:
         cur.execute("SELECT card_id FROM true_mentions GROUP BY card_id ORDER BY count(*) DESC LIMIT 1")
         cid = cur.fetchone()["card_id"]
@@ -89,6 +89,8 @@ def test_extraction_block_grades_a_source(seeded):
         g = out["test:copy"]
         assert g["measured"] and g["cards"] == 1
         assert g["mention_precision"] == 1.0 and g["mention_recall"] == 1.0
+        # a coverage ratio prints beside the n it is over (1.000 over 5 is not a ceiling)
+        assert "bridges graded (count)" in capsys.readouterr().out
     finally:
         with seeded.conn.cursor() as cur:
             for t in ("entities", "mentions", "extracted_cards"):

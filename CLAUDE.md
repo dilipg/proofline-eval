@@ -41,9 +41,10 @@ uv run --python 3.12 --with pytest --with "numpy>=1.26" --with "psycopg[binary]>
   what is in the DB and only seed if the tables are missing or empty; `--fresh` forces it.
 - `tests/` covers the entity layer, storage, extraction and viz helpers; the checks that
   decide anything are still runs: `smoke` for a code path, `quick` for numbers.
-  `assert_no_truth_leak()` runs before every branch. `--no-entities` reproduces the
-  pre-ontology corpus byte for byte (golden digests in `tests/test_entities.py`), and
-  `tests/compare_reports.py` diffs two reports' branch payloads.
+  `assert_no_truth_leak()` runs before every branch. The entity layer is on by default,
+  so synthetic reports from before it compare only under `--no-entities`, which
+  reproduces the pre-ontology corpus byte for byte (golden digests in
+  `tests/test_entities.py`); `tests/compare_reports.py` diffs two reports' branch payloads.
 - Windows: `main()` reconfigures stdout to UTF-8, so pipes print the rule characters;
   read source and JSON with `encoding="utf-8"`. Windows reports `platform_machine` as
   `AMD64`, so PEP 723 markers for `pgserver` list it beside `x86_64`. The first `uv run`
@@ -89,12 +90,12 @@ becomes `payload[bN]`; anything printed must also be in that dict.
 
 Breaking one of these silently invalidates every number downstream.
 
-1. **The section banner strings are load-bearing.** `truth_leak_in()` slices the source
-   from the literal `"# §4  Retrieval index"` to the first `"# §11  Branch"` (its own
-   split call, inside §10) and exits if any planted literal (`true_support`,
-   `true_mentions`, `true_facts`, `true_entities`) appears in that span. Renaming either
-   banner (spacing included) breaks the guard silently. Planted truth is read in §1, §2
-   and §11 (B1) only.
+1. **The section banner strings are load-bearing.** `guarded_span()` takes the source
+   from the `# §4  Retrieval index` banner line to the `# §11  Branch` banner line, and
+   `assert_no_truth_leak()` exits if any planted literal (`true_support`,
+   `true_mentions`, `true_facts`, `true_entities`) appears there. A renamed §4 banner
+   stops the run; a renamed §11 banner stretches the span into B1's planted reads, which
+   trip it. Planted truth is read in §1, §2 and §11 (B1) only.
 2. **Paired, never two means.** Comparisons go through `paired()` + `bootstrap_ci()` over
    the same query ids. `verdict_of()` returns BETTER / WORSE / **UNDERPOWERED**. The
    third is a real verdict, not a fallback.
