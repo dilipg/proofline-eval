@@ -590,6 +590,19 @@ def _snowball(adj: dict, seeds: Sequence[str], target: int,
     return order
 
 
+def version_cited_at(chain: Sequence[tuple[datetime, str]], when: datetime) -> Optional[str]:
+    """The version of a cited paper that existed when the citing card appeared, or None.
+
+    None drops the edge. A paper cited before its first version existed is a citation
+    from the future; pointing it at v1 anyway (the old fallback) planted exactly the
+    forward-in-time edges the snapshot mask exists to rule out."""
+    best = None
+    for ts, cid in chain:
+        if ts <= when:
+            best = cid
+    return best
+
+
 def build_corpus_arxiv(cfg: Config, n_cards: int) -> Corpus:
     meta_p = DATA_DIR / "arxiv-subset.jsonl"
     cites_p = DATA_DIR / "citations-arxiv.tsv"
@@ -666,22 +679,13 @@ def build_corpus_arxiv(cfg: Config, n_cards: int) -> Corpus:
         chains[pid] = chain
 
     by_id = {c.id: c for c in cards}
-    head = {pid: ch[0][1] for pid, ch in chains.items()}
-
-    def cited_card(target: str, when: datetime):
-        """Cite the version of the target that existed when the citing paper appeared."""
-        best = None
-        for ts, cid in chains.get(target, ()):
-            if ts <= when:
-                best = cid
-        return best or head.get(target)
 
     n_edges = 0
     for c in cards:
         pid = c.id.rsplit("v", 1)[0]
         for tgt in cites.get(pid, ()):
             if tgt in keep:
-                t = cited_card(tgt, c.committed_at)
+                t = version_cited_at(chains.get(tgt, ()), c.committed_at)
                 if t and t != c.id:
                     c.citation_ids.append(t); n_edges += 1
 
@@ -809,9 +813,10 @@ CREATE INDEX IF NOT EXISTS cards_pl     ON cards (proofline_id);
 -- exists here so the harness can grade its own labels; nothing that runs in
 -- production is allowed to read it. See assert_no_truth_leak().
 CREATE TABLE IF NOT EXISTS edges (
-  src  text NOT NULL,
-  dst  text NOT NULL,
-  kind text NOT NULL CHECK (kind IN ('parent','citation','true_support')),
+  src        text NOT NULL,
+  dst        text NOT NULL,
+  kind       text NOT NULL CHECK (kind IN ('parent','citation','true_support')),
+  valid_from timestamptz NOT NULL,       -- the citing card's committed_at
   PRIMARY KEY (src, dst, kind)
 );
 CREATE INDEX IF NOT EXISTS edges_dst ON edges (dst, kind);
@@ -861,6 +866,30 @@ CREATE TABLE IF NOT EXISTS metrics (
 """
 
 
+def time_valid_edges(corpus: Corpus) -> tuple[list[tuple[str, str, str, datetime]], dict[str, int]]:
+    """Every edge whose target existed when its source was written, with that time.
+
+    An edge that points forward in time is not a citation anyone could have made, and a
+    graph feature built on it scores a 1998 query with 2020 structure. Checked per edge,
+    so a successor that inherited a parent list keeps whatever is valid for IT."""
+    rows: list[tuple[str, str, str, datetime]] = []
+    dropped: dict[str, int] = defaultdict(int)
+    seen: set[tuple[str, str, str]] = set()
+    for c in corpus.cards:
+        for kind, lst in (("parent", c.parent_ids), ("citation", c.citation_ids),
+                          ("true_support", c.true_support)):
+            for d in lst:
+                if (c.id, d, kind) in seen:
+                    continue
+                seen.add((c.id, d, kind))
+                dst = corpus.by_id.get(d)
+                if dst is None or dst.committed_at > c.committed_at:
+                    dropped[kind] += 1
+                    continue
+                rows.append((c.id, d, kind, c.committed_at))
+    return rows, dict(dropped)
+
+
 class Store:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -908,15 +937,11 @@ class Store:
                     cp.write_row((c.id, c.proofline_id, c.topic, c.kc_type, c.kc_stage,
                                   c.title, c.one_line, c.body, c.committed_at, c.version,
                                   c.supersedes_id, c.is_current, c.text))
-            with cur.copy("COPY edges (src,dst,kind) FROM STDIN") as cp:
-                seen = set()
-                for c in corpus.cards:
-                    for k, lst in (("parent", c.parent_ids), ("citation", c.citation_ids),
-                                   ("true_support", c.true_support)):
-                        for d in lst:
-                            if (c.id, d, k) not in seen:
-                                seen.add((c.id, d, k))
-                                cp.write_row((c.id, d, k))
+            edge_rows, dropped = time_valid_edges(corpus)
+            corpus.stats["forward_edges_dropped"] = dropped
+            with cur.copy("COPY edges (src,dst,kind,valid_from) FROM STDIN") as cp:
+                for r in edge_rows:
+                    cp.write_row(r)
             with cur.copy(
                 "COPY queries (id,provenance,text,as_of,source_card,answerable,slices) "
                 "FROM STDIN"
@@ -1193,14 +1218,26 @@ class Index:
                            dtype=np.float64)
         self._mask_cache: dict[float, np.ndarray] = {}
         self.graph: dict[str, list[str]] = {}
+        self._cite_ts: dict[str, np.ndarray] = {}
 
-    def attach_graph(self, edges: dict[str, list[str]]) -> None:
-        self.graph = edges
-        self.indeg = defaultdict(int)
-        for src, dsts in edges.items():
-            for d in dsts:
-                if d in self.pos:
-                    self.indeg[d] += 1
+    def attach_graph(self, edges: Sequence[tuple[str, str, datetime]]) -> None:
+        """`edges` are (src, dst, valid_from). In-degree is counted AS OF a query time: a
+        citation written after `as_of` did not exist yet, and one from a card outside
+        this corpus (a scale point's sample) does not exist at all."""
+        g: dict[str, list[str]] = defaultdict(list)
+        cites: dict[str, list[float]] = defaultdict(list)
+        for src, dst, vf in edges:
+            g[src].append(dst)
+            if dst in self.pos and src in self.pos:
+                cites[dst].append(vf.timestamp())
+        self.graph = dict(g)
+        self._cite_ts = {d: np.sort(np.asarray(ts, dtype=np.float64)) for d, ts in cites.items()}
+
+    def indeg_at(self, cid: str, as_of: datetime) -> int:
+        ts = self._cite_ts.get(cid)
+        if ts is None:
+            return 0
+        return int(np.searchsorted(ts, as_of.timestamp(), side="right"))
 
     def snapshot_mask(self, as_of: datetime) -> np.ndarray:
         """The corpus as it stood at `as_of`, as a boolean mask.
@@ -1368,7 +1405,7 @@ class GraphBoost(Scorer):
         for i, v in fused.items():
             if not m[i]:
                 continue
-            s[i] = v * (1.0 + 0.35 * math.log1p(self.idx.indeg.get(self.idx.ids[i], 0)))
+            s[i] = v * (1.0 + 0.35 * math.log1p(self.idx.indeg_at(self.idx.ids[i], q.as_of)))
         return self._emit(topn(s, k), s, k)
 
 
@@ -2019,11 +2056,9 @@ def build_index(store: Store, n_limit: Optional[int],
     rows = store.subset(keep, n_limit)
     idx = Index(rows)
     with store.conn.cursor() as cur:
-        cur.execute("SELECT src, dst FROM edges WHERE kind IN ('parent','citation')")
-        g: dict[str, list[str]] = defaultdict(list)
-        for r in cur.fetchall():
-            g[r["src"]].append(r["dst"])
-    idx.attach_graph(g)
+        cur.execute("SELECT src, dst, valid_from FROM edges WHERE kind IN ('parent','citation')")
+        edges = [(r["src"], r["dst"], r["valid_from"]) for r in cur.fetchall()]
+    idx.attach_graph(edges)
     _INDEX_CACHE[key] = idx
     return idx
 
@@ -2883,6 +2918,9 @@ scorers: """ + ", ".join(SCORERS) + """
         try:
             cur.execute("SELECT count(*) n, count(embedding) e FROM cards")
             r = cur.fetchone()
+            # A DB seeded before edges carried valid_from is an older schema, not a
+            # corpus: re-seed it rather than half-read it.
+            cur.execute("SELECT valid_from FROM edges LIMIT 0")
             n_cards, n_emb, compatible = r["n"], r["e"], True
         except psycopg.Error:
             # a table left over from an older schema is not a corpus; start clean
