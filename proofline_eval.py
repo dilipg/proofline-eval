@@ -2063,14 +2063,26 @@ class Scorer:
         sc = [y for _, y in pairs]
         return Scored(ids, sc, sc[0] if sc else 0.0)
 
-    def _emit_chain(self, scores: dict[int, float], k: int, top: float) -> Scored:
-        """For the multi-hop scorers: the top k by score, a chain ordered by when each
-        card was written (metadata, as with supersession), and the FIRST STAGE's top as
-        the abstention score, so every scorer that shares that stage shares a threshold."""
-        order = [i for i in ranked_ids(scores) if scores[i] > 0][:k]
+    def _emit_hops(self, fs: dict[int, float], second: dict[int, float], k: int) -> Scored:
+        """Spend the top k on BOTH hops: the first stage's best half, then what the second
+        hop discovered (cards the first stage did not seed), then the remaining seeds by
+        the second hop's score. Fused into one list instead, the ten seeds fill the top
+        ten: on smoke the ontology walk ranked the bridge card first among its
+        discoveries in 27 of 36 bridge queries, and in the fused top ten in none.
+
+        The chain is ordered by when each card was written (metadata, as with
+        supersession); the abstention score is the FIRST STAGE's top, so every scorer that
+        shares that stage shares a threshold."""
+        first = ranked_ids(fs)
+        seeds = set(first[:10])
+        head = first[:max(1, k // 2)]
+        found = [i for i in ranked_ids(second) if i not in seeds and second[i] > 0]
+        rest = sorted((i for i in seeds if i not in head), key=lambda i: (-second.get(i, 0.0), i))
+        order = list(dict.fromkeys(head + found + rest + first[10:]))[:k]
         ids = [self.idx.ids[i] for i in order]
         chain = [self.idx.ids[i] for i in sorted(order, key=lambda i: (self.idx.ts[i], i))]
-        return Scored(ids, [float(scores[i]) for i in order], top, chain)
+        return Scored(ids, [1.0 / (r + 1) for r in range(len(ids))],
+                      max(fs.values(), default=0.0), chain)
 
 
 class BM25Scorer(Scorer):
@@ -2217,8 +2229,7 @@ class TwoStep(Scorer):
         tf = Counter(t for i in top5 for t in self.idx.docs[i] if t not in seen)
         terms = sorted(tf, key=lambda t: (-tf[t] * self.idx.idf.get(t, 0.0), t))[:10]
         fs2 = first_stage(self.idx, self.embedder, replace(q, text=q.text + " " + " ".join(terms)))
-        fused = rrf([ranked_ids(fs), ranked_ids(fs2)])
-        return self._emit_chain(fused, k, max(fs.values(), default=0.0))
+        return self._emit_hops(fs, fs2, k)
 
 
 class DagWalk(Scorer):
@@ -2245,9 +2256,7 @@ class DagWalk(Scorer):
                 j = self.idx.pos.get(n)
                 if j is not None and ok[j]:
                     exp[j] = max(exp.get(j, 0.0), 0.5 * fs[i])
-        fused = rrf([ranked_ids(fs), ranked_ids(exp)])
-        return self._emit_chain({i: v for i, v in fused.items() if ok[i]}, k,
-                                max(fs.values(), default=0.0))
+        return self._emit_hops(fs, exp, k)
 
 
 class OntoWalk(Scorer):
@@ -2265,8 +2274,7 @@ class OntoWalk(Scorer):
         fs = first_stage(self.idx, self.embedder, q)
         seed = {i: fs[i] for i in ranked_ids(fs)[:10]}
         p = self.idx.onto.ppr(seed, q.as_of, q.intent, self.idx.snapshot_mask(q.as_of))
-        scores = {int(i): float(p[i]) for i in np.nonzero(p > 0)[0] if ok[i]}
-        return self._emit_chain(scores, k, max(fs.values(), default=0.0))
+        return self._emit_hops(fs, {int(i): float(p[i]) for i in np.nonzero(p > 0)[0] if ok[i]}, k)
 
 
 class LLMCache:
@@ -4001,6 +4009,152 @@ def branch4_loop(store: Store, cfg: Config, embedder: Embedder,
     return dict(rows=rows, hard_checks=hc, decision=decision, reasons=reasons,
                 underpowered=under, held_out_prooflines=len(held))
 
+B5_REFERENCE = "hybrid_rrf_fresh"
+B5_METHODS = ("two_step", "dag_walk", "onto_walk", "onto_llm_walk")
+B5_PAIRS = [(B5_REFERENCE, m) for m in B5_METHODS] + [
+    ("dag_walk", "onto_walk"), ("two_step", "onto_walk"), ("two_step", "dag_walk"),
+    ("onto_walk", "onto_llm_walk")]
+B5_SLICES = ("linked", "unlinked", "hops2", "hops3", "alias", "cross_project", "set_gt_k")
+
+
+def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Tracer) -> dict:
+    """B5: which way of ingesting the record finds evidence spread across cards.
+
+    Every comparison is paired on the same multi-hop query ids and reads chain_recall:
+    a query counts only when EVERY hop's evidence is in the top k."""
+    rule("B5  MULTI-HOP: DAG vs ontology vs query-side, on planted multi-hop questions")
+    every = load_queries(store, "multihop")
+    if not every:
+        log("  no multi-hop queries: they are planted in the synthetic corpus only "
+            "(seed without --no-entities)")
+        return {}
+    qs = [q for q in every if q.answerable]
+    twins = [q for q in every if not q.answerable]
+    with store.conn.cursor() as cur:
+        cur.execute("SELECT coalesce(family,'?') f, coalesce(dropped,'kept') d, count(*) n "
+                    "FROM queries WHERE provenance='multihop' GROUP BY 1, 2 ORDER BY 1, 2")
+        dropped = [dict(r) for r in cur.fetchall()]
+        cur.execute("SELECT id, proofline_id, committed_at FROM cards")
+        meta = {r["id"]: r for r in cur.fetchall()}
+    ts = {cid: r["committed_at"].timestamp() for cid, r in meta.items()}
+    counts = dict(Counter(q.family for q in every))
+    log("  queries: " + ", ".join(f"{f} {n}" for f, n in sorted(counts.items())))
+    log("  disconnection filter: " + ", ".join(
+        f"{r['f']}:{r['d']}={r['n']}" for r in dropped if r["d"] != "kept"))
+
+    lines = sorted({meta[q.source_card]["proofline_id"] for q in qs if q.source_card in meta})
+    rng = random.Random(cfg.seed)
+    held = set(rng.sample(lines, k=max(1, len(lines) // 5))) if lines else set()
+    dev = [q for q in qs if meta[q.source_card]["proofline_id"] not in held]
+    tst = [q for q in qs if meta[q.source_card]["proofline_id"] in held]
+
+    names = [B5_REFERENCE] + (["rerank"] if cfg.b5_rerank else []) + list(B5_METHODS)
+    skipped = {}
+    if not extraction_available(store, cfg.extractor):
+        for nm in ("onto_walk", "onto_llm_walk"):
+            skipped[nm] = (f"NOT INGESTED: no extraction '{cfg.extractor}'; run ingest_semantica.py "
+                           f"or pass --extractor")
+            log(f"  {nm}: {skipped[nm]}")
+    names = [n for n in names if n not in skipped]
+
+    idx = build_index(store, None, None, cfg.extractor if "onto_walk" in names else None)
+    fs_tops = sorted(max(first_stage(idx, embedder, q).values(), default=0.0) for q in dev)
+    shared_thr = float(np.quantile(fs_tops, cfg.abstain_fabr)) if fs_tops else float("-inf")
+    thr = {n: shared_thr for n in names if n in B5_METHODS}
+    for n in names:
+        if n not in B5_METHODS:
+            thr[n] = calibrate_abstain(store, SCORERS[n](), embedder, dev, cfg, tracer)
+
+    runs: dict[str, RunResult] = {}
+    walker = make_walker(cfg.walker) if "onto_llm_walk" in names else None
+    for n in names:
+        sc = SCORERS[n]()
+        target = qs + twins
+        if n == "onto_llm_walk":
+            sc.walker = walker
+            keep_ids = {q.id for q in (tst or qs)[:cfg.llm_queries]}
+            groups = {q.pair_id for q in qs if q.id in keep_ids and q.pair_id}
+            target = [q for q in every if q.id in keep_ids or (q.pair_id and q.pair_id in groups)]
+        runs[n] = execute_run(store, sc, embedder, target, "multihop", None, cfg.topk, tracer,
+                              threshold=thr[n],
+                              extractor=cfg.extractor if sc.uses_ontology else None)
+    # twins ran in the same runs; score_runs skips unanswerable queries itself but must
+    # be able to look every ranked id up
+    score_runs(list(runs.values()), every, cfg.topk, ts=ts)
+
+    oracle_rank = {q.id: [min(s, key=lambda c: (ts[c], c)) for s in
+                          sorted(q.slots, key=lambda s: min(ts[c] for c in s))] for q in qs}
+    oracle = RunResult("oracle", "multihop", 0, oracle_rank, {q.id: 1.0 for q in qs},
+                       chains=oracle_rank)
+    score_runs([oracle], qs, 10 ** 6, ts=ts)        # plumbing check: depth must not cap it
+    ov = lambda key: statistics.fmean([v[key] for v in oracle.per_query.values()
+                                       if not math.isnan(v.get(key, float("nan")))] or [float("nan")])
+    oracle_out = dict(chain_recall=ov("chain_recall"), order_tau=ov("order_tau"))
+    if oracle_out["chain_recall"] != 1.0:
+        log(f"  HARNESS BUG: the gold-chain oracle scored chain_recall {oracle_out['chain_recall']}")
+
+    latest_snapshot = store.snapshot(max(q.as_of for q in every))
+    groups: dict[str, list[Query]] = defaultdict(list)
+    for q in every:
+        if q.pair_id:
+            groups[q.pair_id].append(q)
+
+    def pair_both(r: RunResult) -> float:
+        ok = []
+        for members in groups.values():
+            if not all(m.id in r.ranked for m in members):
+                continue
+            ok.append(all((not m.answerable and not r.ranked[m.id]) or
+                          (m.answerable and r.per_query.get(m.id, {}).get("chain_recall") == 1.0)
+                          for m in members))
+        return statistics.fmean(ok) if ok else float("nan")
+
+    def mean_of(r: RunResult, key: str) -> float:
+        vals = [v[key] for v in r.per_query.values() if key in v and not math.isnan(v[key])]
+        return statistics.fmean(vals) if vals else float("nan")
+
+    summary = {}
+    log(f"\n  {'scorer':<18}{'n':>6}{'chain':>8}{'slot':>8}{'order':>8}{'pair':>8}{'ms/q':>8}  hard checks")
+    for n, r in runs.items():
+        hc = hard_checks(r, latest_snapshot, [q for q in every if q.id in r.ranked], cfg.topk)
+        summary[n] = dict(n=sum(1 for q in qs if q.id in r.per_query),
+                          chain_recall=mean_of(r, "chain_recall"), slot_recall=mean_of(r, "slot_recall"),
+                          order_tau=mean_of(r, "order_tau"), pair_both=pair_both(r),
+                          ms_per_query=r.timing_ms / max(1, len(r.ranked)), hard_checks=hc)
+        s = summary[n]
+        fails = ", ".join(f"{k} {v['fails']}" for k, v in hc.items() if v["fails"]) or "pass"
+        log(f"  {n:<18}{s['n']:>6}{s['chain_recall']:>8.3f}{s['slot_recall']:>8.3f}"
+            f"{s['order_tau']:>8.3f}{s['pair_both']:>8.3f}{s['ms_per_query']:>8.1f}  {fails}")
+    log(f"  {'oracle (gold)':<18}{len(qs):>6}{oracle_out['chain_recall']:>8.3f}{'':>8}"
+        f"{oracle_out['order_tau']:>8.3f}")
+
+    comparisons = []
+    for a, b in B5_PAIRS:
+        if a not in runs or b not in runs:
+            continue
+        labels = [("overall", [q.id for q in qs]), ("  dev split", [q.id for q in dev]),
+                  ("  held-out prooflines", [q.id for q in tst])]
+        labels += [(f"  {f}", [q.id for q in qs if q.family == f]) for f in MH_FAMILIES]
+        if (a, b) in (("dag_walk", "onto_walk"), (B5_REFERENCE, "onto_walk")):
+            labels += [(f"  {s}", [q.id for q in qs if s in q.slices]) for s in B5_SLICES]
+        rows = []
+        for label, ids in labels:
+            d, keep = paired(runs[a], runs[b], "chain_recall", ids)
+            mean, lo, hi = bootstrap_ci(d, cfg.bootstrap)
+            mc = mcnemar([runs[a].per_query[q]["chain_recall"] == 1.0 for q in keep],
+                         [runs[b].per_query[q]["chain_recall"] == 1.0 for q in keep])
+            rows.append(dict(label=label, n=len(d), mean=mean, lo=lo, hi=hi,
+                             verdict=verdict_of(mean, lo, hi), mcnemar_p=mc["p"]))
+        comparisons.append(dict(a=a, b=b, rows=rows))
+        log(f"\n  B = {b}  vs  A = {a}   (paired chain_recall@{cfg.topk}, Δ = B - A)")
+        for r in rows:
+            ci = f"[{r['lo']:+.3f},{r['hi']:+.3f}]" if not math.isnan(r["lo"]) else "        n/a"
+            log(f"    {r['label']:<26}{r['n']:>5} {fmt(r['mean']):>8} {ci:>19}  {r['verdict']}")
+
+    return dict(queries=counts, dropped=dropped, skipped=skipped, thresholds=thr,
+                scorers=summary, oracle=oracle_out, comparisons=comparisons,
+                walker_errors=getattr(walker, "errors", 0) if walker else 0)
+
 # ----------------------------------------------------------------------------------
 # §12  CLI
 # ----------------------------------------------------------------------------------
@@ -4051,7 +4205,8 @@ def cmd_ingest(store: Store, cfg: Config, embedder: Embedder, tracer: Tracer) ->
 # saved views target observations BY NAME, so a name carrying a timestamp or a
 # scorer would silently stop matching on the next run.
 BRANCH_TRACE = {"b1": "compare-label-sources", "b2": "calibrate-judge",
-                "b3": "measure-scale-and-abstention", "b4": "gate-release"}
+                "b3": "measure-scale-and-abstention", "b4": "gate-release",
+                "b5": "compare-multihop-methods"}
 
 
 def headline(d: dict, prefix: str = "", depth: int = 0) -> dict:
@@ -4111,7 +4266,7 @@ examples
 
 scorers: """ + ", ".join(SCORERS) + """
 """)
-    ap.add_argument("cmd", choices=["all", "seed", "ingest", "b1", "b2", "b3", "b4",
+    ap.add_argument("cmd", choices=["all", "seed", "ingest", "b1", "b2", "b3", "b4", "b5",
                                     "scorers", "reset"])
     ap.add_argument("--profile", default="quick", choices=list(PROFILES))
     ap.add_argument("--source", default="synthetic", choices=["synthetic", "arxiv"],
@@ -4224,9 +4379,9 @@ scorers: """ + ", ".join(SCORERS) + """
         config={k: (list(v) if isinstance(v, tuple) else v)
                 for k, v in asdict(cfg).items()},
         started=datetime.now(timezone.utc).isoformat())
-    todo = ["b1", "b2", "b3", "b4"] if a.cmd == "all" else [a.cmd]
+    todo = ["b1", "b2", "b3", "b4", "b5"] if a.cmd == "all" else [a.cmd]
     fn = {"b1": branch1_labels, "b2": branch2_judge,
-          "b3": branch3_scale, "b4": branch4_loop}
+          "b3": branch3_scale, "b4": branch4_loop, "b5": branch5_multihop}
     run_id = datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%SZ")
     with tracer.session(run_id):
         for b in todo:

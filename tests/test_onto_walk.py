@@ -41,3 +41,14 @@ def test_circularity_is_checked_for_ontology_labels(monkeypatch):
     monkeypatch.setattr(pe, "ONTOLOGY_DERIVED_LABELS", {"onto_mined"})
     assert pe.check_circularity(pe.OntoWalk(), "onto_mined")
     assert pe.check_circularity(pe.OntoWalk(), "multihop") is None
+
+
+FLOOD = SPEC[:2] + [(f"N{i:02d}", 3, f"quanibraion filler{i} padding{i}", None) for i in range(12)]
+
+
+def test_onto_walk_spends_part_of_k_on_the_second_hop():
+    idx = index_from(FLOOD)
+    idx.onto = pe.OntologyIndex(idx, ENTS, MENTS, [])
+    sc = pe.OntoWalk()
+    sc.prepare(idx, EMB)
+    assert "B" in sc.run(query("quanibraion modrievment lattilency", 6), 10).ids
