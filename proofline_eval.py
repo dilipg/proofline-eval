@@ -1444,13 +1444,19 @@ CREATE TABLE IF NOT EXISTS queries (
   as_of       timestamptz NOT NULL,
   source_card text,
   answerable  boolean NOT NULL,
-  slices      text[] NOT NULL
+  slices      text[] NOT NULL,
+  intent      text NOT NULL DEFAULT 'current',   -- current | history (declared, like as_of)
+  family      text,                              -- multihop family
+  answer      jsonb,                             -- gold answer (P3 scores it)
+  pair_id     text,                              -- contrast group
+  dropped     text                               -- NULL = kept | single_hop | pair_dropped
 );
 
 CREATE TABLE IF NOT EXISTS qrels (
   query_id text NOT NULL,
   card_id  text NOT NULL,
   grade    real NOT NULL,
+  slot     smallint,                             -- hop index (multihop only)
   PRIMARY KEY (query_id, card_id)
 );
 
@@ -1571,18 +1577,25 @@ class Store:
                     for s, r, o, v in c.true_facts:
                         cp.write_row((c.id, s, r, o, v))
             with cur.copy(
-                "COPY queries (id,provenance,text,as_of,source_card,answerable,slices) "
-                "FROM STDIN"
+                "COPY queries (id,provenance,text,as_of,source_card,answerable,slices,"
+                "intent,family,answer,pair_id) FROM STDIN"
             ) as cp:
                 for prov, qs in corpus.queries.items():
                     for q in qs:
                         cp.write_row((q.id, prov, q.text, q.as_of, q.source_card,
-                                      q.answerable, q.slices))
-            with cur.copy("COPY qrels (query_id,card_id,grade) FROM STDIN") as cp:
+                                      q.answerable, q.slices, q.intent, q.family,
+                                      json.dumps(q.answer) if q.answer is not None else None,
+                                      q.pair_id))
+            with cur.copy("COPY qrels (query_id,card_id,grade,slot) FROM STDIN") as cp:
                 for qs in corpus.queries.values():
                     for q in qs:
-                        for cid, g in q.rel.items():
-                            cp.write_row((q.id, cid, g))
+                        if q.slots:
+                            for i, members in enumerate(q.slots):
+                                for cid in sorted(members):
+                                    cp.write_row((q.id, cid, q.rel.get(cid, 2.0), i))
+                        else:
+                            for cid, g in q.rel.items():
+                                cp.write_row((q.id, cid, g, None))
             cur.execute("SET session_replication_role = origin;")
             cur.execute("ANALYZE;")
 
@@ -2665,21 +2678,26 @@ class RunResult:
     timing_ms: float = 0.0
 
 
-def load_queries(store: Store, provenance: str) -> list[Query]:
+def load_queries(store: Store, provenance: str, include_dropped: bool = False) -> list[Query]:
     with store.conn.cursor() as cur:
-        cur.execute("SELECT * FROM queries WHERE provenance = %s ORDER BY id",
-                    (provenance,))
+        cur.execute("SELECT * FROM queries WHERE provenance = %s AND (dropped IS NULL OR %s) "
+                    "ORDER BY id", (provenance, include_dropped))
         qs = cur.fetchall()
-        cur.execute("SELECT q.id qid, r.card_id, r.grade FROM queries q "
+        cur.execute("SELECT q.id qid, r.card_id, r.grade, r.slot FROM queries q "
                     "JOIN qrels r ON r.query_id = q.id WHERE q.provenance = %s",
                     (provenance,))
         rel: dict[str, dict[str, float]] = defaultdict(dict)
+        slots: dict[str, dict[int, set]] = defaultdict(lambda: defaultdict(set))
         for r in cur.fetchall():
             rel[r["qid"]][r["card_id"]] = float(r["grade"])
+            if r["slot"] is not None:
+                slots[r["qid"]][r["slot"]].add(r["card_id"])
     return [Query(id=q["id"], text=q["text"], provenance=q["provenance"],
                   as_of=q["as_of"], source_card=q["source_card"],
                   rel=rel.get(q["id"], {}), slices=list(q["slices"]),
-                  answerable=q["answerable"]) for q in qs]
+                  answerable=q["answerable"], intent=q["intent"], family=q["family"],
+                  slots=[s for _i, s in sorted(slots[q["id"]].items())],
+                  answer=q["answer"], pair_id=q["pair_id"]) for q in qs]
 
 
 _INDEX_CACHE: dict[Any, Index] = {}
@@ -3775,6 +3793,8 @@ scorers: """ + ", ".join(SCORERS) + """
             # corpus: re-seed it rather than half-read it.
             cur.execute("SELECT valid_from FROM edges LIMIT 0")
             cur.execute("SELECT 1 FROM true_mentions LIMIT 0")
+            cur.execute("SELECT intent, family, answer, pair_id, dropped FROM queries LIMIT 0")
+            cur.execute("SELECT slot FROM qrels LIMIT 0")
             n_cards, n_emb, compatible = r["n"], r["e"], True
         except psycopg.Error:
             # a table left over from an older schema is not a corpus; start clean
