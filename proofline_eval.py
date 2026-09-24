@@ -622,14 +622,16 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
 MH_FAMILIES = ("bridge", "bridge3", "chrono_asof", "timeline", "history",
                "aggregate_set", "aggregate_count")
 LAST_HOP_FAMILIES = ("bridge", "bridge3", "chrono_asof")
+# {mkind} names the method's ontology kind: card A often uses several methods, and a
+# question must pick out one of them (see `sole` below)
 _MH_CUE = {
-    "bridge": "what score did the method used here reach on its {kind}",
-    "bridge3": "what score did the method that the approach used here extends reach on its {kind}",
-    "chrono_asof": "what score did the method used here reach on its {kind}",
-    "timeline": "how have reported results for the method used here changed over time",
-    "history": "what did the reported result for the method used here read before it was revised",
-    "aggregate_set": "which datasets have results been reported on for the method used here",
-    "aggregate_count": "how many results have been reported for the method used here",
+    "bridge": "what score did the {mkind} method used here reach on its {kind}",
+    "bridge3": "what score did the method that the {mkind} approach used here extends reach on its {kind}",
+    "chrono_asof": "what score did the {mkind} method used here reach on its {kind}",
+    "timeline": "how have reported results for the {mkind} method used here changed over time",
+    "history": "what did the reported result for the {mkind} method used here read before it was revised",
+    "aggregate_set": "which datasets have results been reported on for the {mkind} method used here",
+    "aggregate_count": "how many results have been reported for the {mkind} method used here",
 }
 
 
@@ -699,9 +701,10 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
         return sorted({v for c, dd, v in reports[m]
                        if dd == d and c.id in succ and succ[c.id].committed_at <= t})
 
-    def question(a: Card, cue: str) -> str:
+    def question(a: Card, family: str, m: str, d: Optional[str] = None) -> str:
         own = [w for w in a.terms if w not in a.inherited_terms] or a.terms
         pick = rng.sample(own, k=min(len(own), rng.randrange(4, 8)))
+        cue = _MH_CUE[family].format(mkind=_KIND_WORD[kind[m]], kind=_KIND_WORD[kind[d]] if d else "")
         return " ".join(_paraphrase(pick, rng)) + " " + cue
 
     def linked(a: Card, gold: Card) -> bool:
@@ -709,6 +712,27 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
 
     def alias_used(gold: Card, m: str) -> bool:
         return any(e == m and s != ename[m] for e, s, _r in gold.true_mentions)
+
+    def methods_used(c: Card) -> set:
+        return {e for e, _s, role in c.true_mentions if role == "uses" and top_class(kind[e]) == "Method"}
+
+    def sole(a: Card, m: str, named: str) -> bool:
+        """'The sampling method used here' must mean m and nothing else. When card A uses
+        two sampling methods that both have results, a reader can answer through either,
+        and a twin asked before m's first result still has an answer through the other.
+        `named` is the method whose kind the cue names: m itself, or for bridge3 the
+        method A uses that extends m. Versions carry their root's mentions."""
+        used = {x for x in methods_used(a) if kind[x] == kind[named]}
+        if named != m:                   # bridge3: 'the method the approach used here extends'
+            used = {extends[x][1] for x in used if x in extends}
+        ok = {x for x in used if reports[x]} == {m}
+        stats["skipped_ambiguous"] += not ok
+        return ok
+
+    def asked_at(lower: datetime) -> datetime:
+        # families with no natural time of their own are asked at a random moment in
+        # their window, not all at `end`, where the as-of mask would be the whole record
+        return lower + (end - lower) * rng.random()
 
     out: list[Query] = []
     stats: Counter = Counter()
@@ -721,15 +745,14 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
         if len(flat) != len(set(flat)):
             stats["skipped_shared_card"] += 1
             return None
-        slices = [family, "hops3" if family == "bridge3" else "hops2"]
+        slices = [family, "hops3" if family == "bridge3" else
+                  "hops2" if family in LAST_HOP_FAMILIES else "multi_doc"]
         if gold is not None and family in LAST_HOP_FAMILIES:
             slices.append("linked" if linked(a, gold) else "unlinked")
             if alias_used(gold, answer["_m"]):
                 slices.append("alias")
             if gold.proofline_id != a.proofline_id:
                 slices.append("cross_project")
-        if family.startswith("aggregate") and len(slots) - 1 > topk:
-            slices.append("set_gt_k")
         answer = {k: v for k, v in answer.items() if not k.startswith("_")}
         q = Query(id=f"q_mh_{family}_{stats[family]:05d}", text=text, provenance="multihop",
                   as_of=t, source_card=a.id, rel={cid: 2.0 for cid in flat}, slices=slices,
@@ -753,12 +776,39 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
                          answerable=False, family="twin", pair_id=q.id))
         stats["twin"] += 1
 
+    def aggregate(fam: str, m: str, a_root: Card, t: datetime):
+        a, r = version_at(a_root, t), reports_at(m, t)
+        if not a or not 2 <= len(r) <= topk - 1:
+            return None
+        by_d: dict[str, set] = defaultdict(set)
+        for c, d, _v in r.values():
+            by_d[d].add(c.id)
+        if fam == "aggregate_set" and not 2 <= len(by_d) <= 8:
+            return None
+        if fam == "aggregate_set" and any(valid(c, t) and set(by_d) <= ds_ for c, ds_ in stated[m]):
+            stats["skipped_single_card"] += 1         # one card already names the whole set
+            return None
+        if fam == "aggregate_set":
+            order = sorted(by_d, key=lambda d: min(by_id[c].committed_at for c in by_d[d]))
+            slots = [{a.id}] + [by_d[d] for d in order]
+            answer = {"set": sorted(ename[d] for d in order)}
+        else:
+            slots = [{a.id}] + [{c.id} for c, _d, _v in
+                                sorted(r.values(), key=lambda x: x[0].committed_at)]
+            answer = {"count": len(r)}
+        return a, slots, answer
+
     pairs = [(m, u) for m in sorted(users) if reports[m] for u in sorted(users[m])]
     rng.shuffle(pairs)
 
     for m, uid in pairs:
         a_root = users[m][uid]
+        if not sole(a_root, m, m):
+            continue
         lower = max(a_root.committed_at, first_report(m))
+        # the earliest moment two results of m exist: before it, no timeline or aggregate
+        second = sorted(c.committed_at for c, _d, _v in reports[m])[1:2]
+        lower2 = max(a_root.committed_at, second[0]) if second else end
 
         if stats["bridge"] < cap:
             t = min(end, lower + timedelta(days=rng.randrange(0, 60)))
@@ -767,7 +817,7 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
                 g, d, v = got
                 q = emit("bridge", a, t, [{a.id}, {g.id}],
                          {"value": v, "stale": stale(m, d, t), "_m": m},
-                         question(a, _MH_CUE["bridge"].format(kind=_KIND_WORD[kind[d]])), gold=g)
+                         question(a, "bridge", m, d), gold=g)
                 if q:
                     twin(q, a_root, m)
 
@@ -784,7 +834,7 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
                     continue
                 if root_of(r1[0]).id == a_root.id or root_of(r2[0]).id == a_root.id:
                     continue
-                text = question(a2, _MH_CUE["chrono_asof"].format(kind=_KIND_WORD[kind[r1[1]]]))
+                text = question(a2, "chrono_asof", m, r1[1])
                 pid = f"pair_chrono_{stats['chrono_asof']:05d}"
                 emit("chrono_asof", a1, t1, [{a1.id}, {r1[0].id}],
                      {"value": r1[2], "stale": stale(m, r1[1], t1), "_m": m}, text,
@@ -795,12 +845,14 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
                 break
 
         if stats["timeline"] < cap:
-            a, r = version_at(a_root, end), reports_at(m, end)
-            if a and len(r) >= 2 and len({d for _c, d, _v in r.values()}) == 1:
-                rs = sorted(r.values(), key=lambda x: (x[0].committed_at, x[0].id))
-                emit("timeline", a, end, [{a.id}] + [{c.id} for c, _d, _v in rs],
-                     {"values": [v for _c, _d, v in rs]},
-                     question(a, _MH_CUE["timeline"]))
+            for t in (asked_at(lower2), end):
+                a, r = version_at(a_root, t), reports_at(m, t)
+                if a and len(r) >= 2 and len({d for _c, d, _v in r.values()}) == 1:
+                    rs = sorted(r.values(), key=lambda x: (x[0].committed_at, x[0].id))
+                    emit("timeline", a, t, [{a.id}] + [{c.id} for c, _d, _v in rs],
+                         {"values": [v for _c, _d, v in rs]},
+                         question(a, "timeline", m))
+                    break
 
         if stats["history"] < cap:
             changed = [root_of(c) for c, _d, _v in reports[m]]
@@ -817,31 +869,17 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
                         for v in vs]
                 if a and rroot.id != a_root.id and len(set(vals)) > 1:
                     emit("history", a, t, [{a.id}] + [{v.id} for v in vs], {"values": vals},
-                         question(a, _MH_CUE["history"]), intent="history")
+                         question(a, "history", m), intent="history")
 
         for fam in ("aggregate_set", "aggregate_count"):
             if stats[fam] >= cap:
                 continue
-            a, r = version_at(a_root, end), reports_at(m, end)
-            if not a or not 2 <= len(r) <= topk - 1:
-                continue
-            by_d: dict[str, set] = defaultdict(set)
-            for c, d, _v in r.values():
-                by_d[d].add(c.id)
-            if fam == "aggregate_set" and not 2 <= len(by_d) <= 8:
-                continue
-            if fam == "aggregate_set" and any(valid(c, end) and set(by_d) <= ds_ for c, ds_ in stated[m]):
-                stats["skipped_single_card"] += 1         # one card already names the whole set
-                continue
-            if fam == "aggregate_set":
-                order = sorted(by_d, key=lambda d: min(by_id[c].committed_at for c in by_d[d]))
-                slots = [{a.id}] + [by_d[d] for d in order]
-                answer = {"set": sorted(ename[d] for d in order)}
-            else:
-                slots = [{a.id}] + [{c.id} for c, _d, _v in
-                                    sorted(r.values(), key=lambda x: x[0].committed_at)]
-                answer = {"count": len(r)}
-            emit(fam, a, end, slots, answer, question(a, _MH_CUE[fam]))
+            for t in (asked_at(lower2), end):
+                got = aggregate(fam, m, a_root, t)
+                if got:
+                    a, slots, answer = got
+                    emit(fam, a, t, slots, answer, question(a, fam, m))
+                    break
 
     for m1, (c_root, m2) in sorted(extends.items()):
         if stats["bridge3"] >= cap:
@@ -852,6 +890,8 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
             if stats["bridge3"] >= cap:
                 break
             a_root = users[m1][uid]
+            if not sole(a_root, m2, m1):
+                continue
             lower = max(a_root.committed_at, c_root.committed_at, first_report(m2))
             t = min(end, lower + timedelta(days=rng.randrange(0, 60)))
             a, c, got = version_at(a_root, t), version_at(c_root, t), latest(m2, t)
@@ -862,7 +902,7 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
                 continue
             q = emit("bridge3", a, t, [{a.id}, {c.id}, {g.id}],
                      {"value": v, "stale": stale(m2, d, t), "_m": m2},
-                     question(a, _MH_CUE["bridge3"].format(kind=_KIND_WORD[kind[d]])), gold=g)
+                     question(a, "bridge3", m1, d), gold=g)
             if q:
                 twin(q, a_root, m2)
 
@@ -2281,7 +2321,8 @@ class OntoWalk(Scorer):
 
     def run(self, q, k):
         if self.idx.onto is None:
-            raise RuntimeError("onto_walk needs an extraction: run ingest_semantica.py")
+            raise SystemExit("onto_walk needs an ontology extraction, and this database has none for "
+                             "--extractor: run `uv run ingest_semantica.py` first")
         ok = pool(self.idx, q)
         fs = first_stage(self.idx, self.embedder, q)
         seed = {i: fs[i] for i in ranked_ids(fs)[:10]}
@@ -2338,6 +2379,13 @@ class MockWalker:
                 "order": sorted(seen, key=lambda i: (seen[i], i))}
 
 
+def walk_step_ok(v: Any) -> bool:
+    """The schema's shape, checked here too: valid JSON is not a valid step."""
+    return (isinstance(v, dict) and isinstance(v.get("done"), bool)
+            and all(isinstance(v.get(f), list) and all(isinstance(i, str) for i in v[f])
+                    for f in ("next", "order")))
+
+
 class AnthropicWalker:
     """Claude through the official SDK, with schema-constrained JSON. Ids it invents are
     dropped; a malformed reply, a refusal or an API error ends the walk and is counted."""
@@ -2367,7 +2415,8 @@ class AnthropicWalker:
         self.calls += 1
         allowed = {e["id"] for e in evidence} | {c["id"] for c in candidates}
         got = self.cache.get(key)
-        if got is None:
+        if not walk_step_ok(got):        # a miss, or a value cached before replies were checked
+            got = None
             try:
                 r = self.client.messages.create(
                     model=self.model, max_tokens=1024, system=WALK_SYSTEM,
@@ -2376,14 +2425,15 @@ class AnthropicWalker:
                 if r.stop_reason != "end_turn":
                     raise ValueError(f"stop_reason={r.stop_reason}")
                 got = json.loads(next(b.text for b in r.content if b.type == "text"))
+                if not walk_step_ok(got):
+                    raise ValueError("reply is not a walk step")
                 self.cache.put(key, got)
             except Exception:
                 self.errors += 1
                 return {"next": [], "done": True, "order": []}
         cand_ids = {c["id"] for c in candidates}
-        return {"next": [i for i in got.get("next", []) if i in cand_ids],
-                "done": bool(got.get("done", True)),
-                "order": [i for i in got.get("order", []) if i in allowed]}
+        return {"next": [i for i in got["next"] if i in cand_ids], "done": got["done"],
+                "order": [i for i in got["order"] if i in allowed]}
 
 
 def make_walker(spec: str):
@@ -2411,7 +2461,8 @@ class OntoLlmWalk(Scorer):
 
     def run(self, q, k):
         if self.idx.onto is None:
-            raise RuntimeError("onto_llm_walk needs an extraction: run ingest_semantica.py")
+            raise SystemExit("onto_llm_walk needs an ontology extraction, and this database has none for "
+                             "--extractor: run `uv run ingest_semantica.py` first")
         walker = self.walker or MockWalker()
         ok = pool(self.idx, q)
         fs = first_stage(self.idx, self.embedder, q)
@@ -4037,7 +4088,7 @@ B5_METHODS = ("two_step", "dag_walk", "onto_walk", "onto_llm_walk")
 B5_PAIRS = [(B5_REFERENCE, m) for m in B5_METHODS] + [
     ("dag_walk", "onto_walk"), ("two_step", "onto_walk"), ("two_step", "dag_walk"),
     ("onto_walk", "onto_llm_walk")]
-B5_SLICES = ("linked", "unlinked", "hops2", "hops3", "alias", "cross_project", "set_gt_k")
+B5_SLICES = ("linked", "unlinked", "hops2", "hops3", "multi_doc", "alias", "cross_project")
 
 
 def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Tracer) -> dict:
@@ -4181,6 +4232,13 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
             f"{s['order_tau']:>8.3f}{s['pair_both']:>8.3f}{s['ms_per_query']:>8.1f}  {fails}")
     log(f"  {'oracle (gold)':<18}{len(qs):>6}{oracle_out['chain_recall']:>8.3f}{'':>8}"
         f"{oracle_out['order_tau']:>8.3f}")
+    twin_note = None
+    if any(s["hard_checks"]["answered_a_no_answer_query"]["fails"] for s in summary.values()):
+        twin_note = ("a twin is asked before its method has any result, so nothing past the first "
+                     "hop is right. A ranker that always returns k cards has no second-hop signal "
+                     "to abstain on, and that is what these fails measure; abstaining is scored "
+                     "with answers, in P3")
+        log(f"\n  twins: {twin_note}")
 
     comparisons = []
     for a, b in B5_PAIRS:
@@ -4208,7 +4266,7 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
     return dict(queries=counts, dropped=dropped, skipped=skipped, thresholds=thr,
                 scorers=summary, oracle=oracle_out, comparisons=comparisons,
                 walker_sample=dict(Counter(q.family for q in walker_pick)) if walker else {},
-                extraction=extraction,
+                extraction=extraction, twin_note=twin_note,
                 walker_errors=getattr(walker, "errors", 0) if walker else 0)
 
 # ----------------------------------------------------------------------------------
@@ -4350,7 +4408,9 @@ scorers: """ + ", ".join(SCORERS) + """
                     help="skip the planted entity layer: reproduces the pre-P1 synthetic corpus")
     ap.add_argument("--walker", default="mock",
                     help="onto_llm_walk: mock, or anthropic:<model> (key read from .env)")
-    ap.add_argument("--llm-queries", type=int, default=80)
+    ap.add_argument("--llm-queries", type=int, default=80,
+                    help="soft cap on the questions onto_llm_walk answers, drawn round-robin "
+                         "across families; the sample can run a few over")
     ap.add_argument("--extractor", default="semantica:regex",
                     help="extraction source the ontology scorers walk (see ingest_semantica.py)")
     ap.add_argument("--b5-rerank", action="store_true")

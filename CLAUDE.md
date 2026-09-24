@@ -175,7 +175,8 @@ RESULTS.html          findings from the full four-branch run on 60k arXiv cards
   that zeroed chain_recall for every method.
 - **New CLI flag**: `argparse` in `main()` *and* the `Config` field *and* the `Config(...)`
   construction, three places, all in one screen. Current additions beyond the original
-  set: `--source`, `--eval-provenance`, `--max-eval-queries`, `--scale-judged-budget`.
+  set: `--source`, `--eval-provenance`, `--max-eval-queries`, `--scale-judged-budget`,
+  `--no-entities`, `--walker`, `--llm-queries`, `--extractor`, `--b5-rerank`.
 - **Judges** are specified `provider` or `provider:model`, so two models from one
   vendor run as two distinct judges (`anthropic:claude-sonnet-5`). Both provider paths
   must be asked the *same* question or cross-judge agreement measures the prompt.

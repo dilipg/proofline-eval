@@ -77,3 +77,27 @@ def test_cache_key_covers_the_system_prompt_and_schema(tmp_path, monkeypatch):
     k = w.cache_key("same prompt")
     monkeypatch.setattr(pe, "WALK_SYSTEM", pe.WALK_SYSTEM + " (edited)")
     assert w.cache_key("same prompt") != k
+
+
+def test_a_non_object_reply_is_an_error_and_is_never_cached(tmp_path):
+    ok = json.dumps({"next": [], "done": True, "order": []})
+    msgs = _FakeMessages([("[]", "end_turn"), (ok, "end_turn")])
+    w = pe.AnthropicWalker("claude-haiku-4-5", client=SimpleNamespace(messages=msgs),
+                           cache_path=tmp_path / "llm.sqlite")
+    ev = [{"id": "A", "date": "2025-01-06", "text": "a"}]
+    assert w.choose("q", day(6), ev, [], 0)["done"] and w.errors == 1
+    w.choose("q", day(6), ev, [], 0)
+    assert msgs.calls == 2                       # the bad reply was not served from cache
+
+
+def test_a_bad_value_already_in_the_cache_is_asked_again(tmp_path):
+    ok = json.dumps({"next": [], "done": True, "order": ["A"]})
+    msgs = _FakeMessages([(ok, "end_turn")])
+    w = pe.AnthropicWalker("claude-haiku-4-5", client=SimpleNamespace(messages=msgs),
+                           cache_path=tmp_path / "llm.sqlite")
+    ev = [{"id": "A", "date": "2025-01-06", "text": "a"}]
+    real_get = w.cache.get
+    # a value cached by a build that did not validate replies
+    w.cache.get = lambda k: w.cache.put(k, ["stale"]) or real_get(k)
+    assert w.choose("q", day(6), ev, [], 0)["order"] == ["A"]
+    assert msgs.calls == 1 and w.errors == 0

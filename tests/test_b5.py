@@ -125,3 +125,10 @@ def test_b5_does_not_report_a_walker_that_failed(ingested, monkeypatch, tmp_path
         assert not any("onto_llm_walk" in (c["a"], c["b"]) for c in out["comparisons"])
     finally:
         _clear_truth_extraction(store)
+
+
+def test_b5_explains_why_every_scorer_answers_the_twins(ingested, capsys):
+    store, emb = ingested
+    out = pe.branch5_multihop(store, pe.Config(profile="smoke", extractor="none:missing"), emb, _NoTrace())
+    if any(s["hard_checks"]["answered_a_no_answer_query"]["fails"] for s in out["scorers"].values()):
+        assert "second-hop signal" in capsys.readouterr().out

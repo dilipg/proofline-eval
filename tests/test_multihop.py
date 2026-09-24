@@ -47,19 +47,46 @@ def test_gold_is_valid_at_as_of_and_slots_are_disjoint(quick):
                 assert nxt is None or nxt.committed_at > q.as_of, q.id
 
 
+def referents(corpus, a, q):
+    """What the question's cue can mean on card A: every method of the named kind A uses,
+    or for bridge3, every method that such a method extends."""
+    word = re.search(r"the (\w+) (?:method|approach) used here", q.text).group(1)
+    want = {k for k, w in pe._KIND_WORD.items() if w == word}
+    kind = {e[0]: e[2] for e in corpus.entities}
+    used = {e for e, _s, role in a.true_mentions if role == "uses" and kind[e] in want}
+    if q.family != "bridge3":
+        return used
+    return {o for c in corpus.cards for s, r, o, _v in c.true_facts if r == "extends" and s in used}
+
+
+def test_the_method_used_here_names_exactly_one_reported_method(quick):
+    # 'the sampling method used here' is ambiguous when card A uses two sampling methods
+    # that both have results: a reader could answer through either
+    reported = {s for c in quick.cards for s, r, _o, _v in c.true_facts if r == "reports"}
+    by_id = {c.id: c for c in quick.cards}
+    for q in mh(quick):
+        if q.answerable:
+            got = referents(quick, by_id[q.source_card], q) & reported
+            assert len(got) == 1, (q.id, q.family, sorted(got))
+
+
 def test_twins_exclude_every_report_of_their_method(quick):
     by_q = {q.id: q for q in mh(quick)}
     groups = defaultdict(list)
     for q in mh(quick):
         if q.pair_id:
             groups[q.pair_id].append(q)
+    by_id = {c.id: c for c in quick.cards}
     twins = [q for q in mh(quick) if q.family == "twin"]
     assert twins
     for t in twins:
         orig = next(x for x in groups[t.pair_id] if x.answerable)
         assert t.text == orig.text and t.as_of < orig.as_of
-        gold = orig.slots[-1]
-        assert all(pe_c.committed_at > t.as_of for pe_c in quick.cards if pe_c.id in gold)
+        # a twin has no answer only if NOTHING the question could refer to had a report yet
+        asked = referents(quick, by_id[t.source_card], orig)
+        reports = [c for c in quick.cards
+                   if any(s in asked and r == "reports" for s, r, _o, _v in c.true_facts)]
+        assert reports and all(c.committed_at > t.as_of for c in reports), t.id
         assert by_q[t.id].rel == {} and not t.answerable
 
 
@@ -118,3 +145,24 @@ def test_no_aggregate_set_is_answerable_from_one_card(quick):
                 if r in ("evaluated_on", "reports"):
                     by_subj[s].add(name[o])
             assert not any(gold <= ds for m, ds in by_subj.items() if m in asked), (q.id, c.id)
+
+
+def test_timeline_and_aggregates_are_not_all_asked_at_the_end(quick):
+    # a question asked at the end of the record has a trivial as-of mask
+    end = max(c.committed_at for c in quick.cards)
+    for fam in ("timeline", "aggregate_set", "aggregate_count"):
+        qs = [q for q in mh(quick) if q.family == fam]
+        at_end = sum(1 for q in qs if q.as_of == end)
+        assert at_end < len(qs) / 2, (fam, at_end, len(qs))
+
+
+def test_hop_slices_mean_what_they_say_and_none_is_dead(quick):
+    for q in mh(quick):
+        if not q.answerable:
+            continue
+        want = ("hops3" if q.family == "bridge3" else
+                "hops2" if q.family in pe.LAST_HOP_FAMILIES else "multi_doc")
+        got = [s for s in ("hops2", "hops3", "multi_doc") if s in q.slices]
+        assert got == [want], (q.id, got)
+    for s in pe.B5_SLICES:
+        assert any(s in q.slices for q in mh(quick)), s

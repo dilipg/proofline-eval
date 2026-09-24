@@ -205,8 +205,12 @@ The synthetic corpus also plants multi-hop questions composed from the entity la
 `bridge3` (one more hop through `extends`), `chrono_asof` (the same question either
 side of a change), `timeline`, `history` (the versions before a revision, which asks
 for superseded cards on purpose), `aggregate_set` and `aggregate_count`, plus no-answer
-twins. None names the bridge entity, and `ingest` drops any question a single hop can
-answer (MuSiQue's disconnection filter), with its pair.
+twins. None names the bridge entity; each names the method's kind instead ("the sampling
+method used here"), and a question is asked only when that picks out exactly one method
+with results, since two would give it two answers and give its twin one. `timeline` and
+the aggregates are asked at a random moment in their window, not all at the end of the
+record, where the as-of mask would be the whole record. `ingest` drops any question a
+single hop can answer (MuSiQue's disconnection filter), with its pair.
 
     uv run proofline_eval.py b5                                   # mock walker, regex extraction
     uv run proofline_eval.py b5 --extractor semantica:llm:anthropic:claude-haiku-4-5 \
@@ -216,7 +220,13 @@ B5 compares `dag_walk` (citation edges), `onto_walk` (Personalized PageRank over
 extracted ontology) and `onto_llm_walk` (an LLM chooses each hop) against the
 query-side control `two_step` and the reference `hybrid_rrf_fresh`, paired on
 chain_recall: a question counts only when every hop's evidence is in the top k. A
-gold-chain oracle row must read 1.000; anything less is a harness bug.
+gold-chain oracle row must read 1.000; anything less is a harness bug. Slices split
+the questions by `hops2` / `hops3` (a last-hop answer two or three cards away) against
+`multi_doc` (timelines, histories, aggregates: several cards, one hop each).
+
+Expect every scorer to fail `answered_a_no_answer_query` on the twins. A ranker always
+returns k cards, so it has no second-hop signal to abstain on; B5 prints a line saying
+so. Abstaining is scored with answers, in P3.
 
 Every multi-hop scorer spends its top k on both hops: the first stage's best half, then
 what the second hop discovered. Fused into one ranked list instead, the first stage's

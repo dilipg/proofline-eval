@@ -52,3 +52,12 @@ def test_onto_walk_spends_part_of_k_on_the_second_hop():
     sc = pe.OntoWalk()
     sc.prepare(idx, EMB)
     assert "B" in sc.run(query("quanibraion modrievment lattilency", 6), 10).ids
+
+
+def test_ontology_scorers_without_an_extraction_say_how_to_get_one():
+    import pytest
+    for cls in (pe.OntoWalk, pe.OntoLlmWalk):
+        sc = cls()
+        sc.prepare(index_from(SPEC), EMB)
+        with pytest.raises(SystemExit, match="ingest_semantica"):
+            sc.run(query("quanibraion", 6), 3)
