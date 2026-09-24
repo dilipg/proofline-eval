@@ -1225,7 +1225,9 @@ def _snowball(adj: dict, seeds: Sequence[str], target: int,
     while frontier and cards < target:
         nxt = []
         for p in frontier:
-            for q in adj.get(p, ()):
+            # sorted: adj holds sets of str, whose order is salted per process, and the
+            # last partial layer decides which papers make the cut
+            for q in sorted(adj.get(p, ())):
                 if q in seen:
                     continue
                 seen.add(q); order.append(q); nxt.append(q)
@@ -1306,7 +1308,7 @@ def build_corpus_arxiv(cfg: Config, n_cards: int) -> Corpus:
     cat_ix = {c: i for i, c in enumerate(cats)}
     cards: list = []
     chains: dict = {}
-    for pid in keep:
+    for pid in keep_order:               # not `keep`: a set's order moves every sample below
         d = papers[pid]
         one_line = _clean(d["abstract"].split(". ")[0])[:300]
         prev = None
