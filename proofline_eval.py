@@ -74,7 +74,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from contextlib import nullcontext
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from itertools import cycle
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
@@ -1868,6 +1868,7 @@ class Index:
         self._mask_cache: dict[float, np.ndarray] = {}
         self.graph: dict[str, list[str]] = {}
         self._cite_ts: dict[str, np.ndarray] = {}
+        self.cited_by: dict[str, list[tuple[str, float]]] = {}
 
     def attach_graph(self, edges: Sequence[tuple[str, str, datetime]]) -> None:
         """`edges` are (src, dst, valid_from). In-degree is counted AS OF a query time: a
@@ -1875,11 +1876,14 @@ class Index:
         this corpus (a scale point's sample) does not exist at all."""
         g: dict[str, list[str]] = defaultdict(list)
         cites: dict[str, list[float]] = defaultdict(list)
+        rev: dict[str, list[tuple[str, float]]] = defaultdict(list)
         for src, dst, vf in edges:
             g[src].append(dst)
             if dst in self.pos and src in self.pos:
                 cites[dst].append(vf.timestamp())
+                rev[dst].append((src, vf.timestamp()))
         self.graph = dict(g)
+        self.cited_by = dict(rev)
         self._cite_ts = {d: np.sort(np.asarray(ts, dtype=np.float64)) for d, ts in cites.items()}
 
     def indeg_at(self, cid: str, as_of: datetime) -> int:
@@ -1949,6 +1953,26 @@ def topn(scores: np.ndarray, n: int) -> list[int]:
     return list(part[np.argsort(-scores[part])])
 
 
+def pool(idx: Index, q: Query) -> np.ndarray:
+    """What a query may see: the record as it stood at as_of, and for a current-intent
+    question only the versions that were current then. A history question keeps them."""
+    m = idx.snapshot_mask(q.as_of)
+    return m & idx.current_at(q.as_of) if q.intent == "current" else m
+
+
+def first_stage(idx: Index, embedder: Embedder, q: Query, n: int = 150) -> dict[int, float]:
+    m = pool(idx, q)
+    lex = np.where(m, idx.bm25(q.text), -np.inf)
+    den = np.where(m, idx.cosine(embedder.encode_queries([q.text])[0]), -np.inf)
+    fused = rrf([[i for i in topn(lex, n) if np.isfinite(lex[i]) and lex[i] > 0],
+                 [i for i in topn(den, n) if np.isfinite(den[i])]])
+    return {i: v for i, v in fused.items() if m[i]}
+
+
+def ranked_ids(d: dict[int, float]) -> list[int]:
+    return [i for i, _v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
 # ----------------------------------------------------------------------------------
 # §5  Scorers
 # ----------------------------------------------------------------------------------
@@ -1983,6 +2007,15 @@ class Scorer:
         ids = [x for x, _ in pairs]
         sc = [y for _, y in pairs]
         return Scored(ids, sc, sc[0] if sc else 0.0)
+
+    def _emit_chain(self, scores: dict[int, float], k: int, top: float) -> Scored:
+        """For the multi-hop scorers: the top k by score, a chain ordered by when each
+        card was written (metadata, as with supersession), and the FIRST STAGE's top as
+        the abstention score, so every scorer that shares that stage shares a threshold."""
+        order = [i for i in ranked_ids(scores) if scores[i] > 0][:k]
+        ids = [self.idx.ids[i] for i in order]
+        chain = [self.idx.ids[i] for i in sorted(order, key=lambda i: (self.idx.ts[i], i))]
+        return Scored(ids, [float(scores[i]) for i in order], top, chain)
 
 
 class BM25Scorer(Scorer):
@@ -2115,9 +2148,57 @@ class CrossEncoderRerank(Scorer):
         return Scored(ids, scores, scores[0] if scores else 0.0)
 
 
+class TwoStep(Scorer):
+    """The query-side control: no new ingest artefact. Retrieve, borrow the rarest words
+    of the top cards, retrieve again, fuse. If an ingest change cannot beat this, it
+    has not paid for itself."""
+    name = "two_step"
+    description = "first stage, then a second pass with feedback terms from its top 5."
+
+    def run(self, q, k):
+        fs = first_stage(self.idx, self.embedder, q)
+        top5 = ranked_ids(fs)[:5]
+        seen = set(re.findall(r"[a-z0-9]+", q.text.lower()))
+        tf = Counter(t for i in top5 for t in self.idx.docs[i] if t not in seen)
+        terms = sorted(tf, key=lambda t: (-tf[t] * self.idx.idf.get(t, 0.0), t))[:10]
+        fs2 = first_stage(self.idx, self.embedder, replace(q, text=q.text + " " + " ".join(terms)))
+        fused = rrf([ranked_ids(fs), ranked_ids(fs2)])
+        return self._emit_chain(fused, k, max(fs.values(), default=0.0))
+
+
+class DagWalk(Scorer):
+    """The DAG method: one hop along the author-recorded parent/citation edges that
+    existed at as_of, from the first stage's top 10."""
+    name = "dag_walk"
+    uses_graph = True
+    description = "first stage, then one hop along parent/citation edges valid at as_of."
+
+    def run(self, q, k):
+        ok = pool(self.idx, q)
+        fs = first_stage(self.idx, self.embedder, q)
+        t = q.as_of.timestamp()
+        # seeds keep their own score in the expansion list, or a neighbour that also
+        # sits in the first stage (dense scores every card) counts twice and outranks
+        # the card that actually matched the question
+        seeds = ranked_ids(fs)[:10]
+        exp: dict[int, float] = {i: fs[i] for i in seeds}
+        for i in seeds:
+            cid = self.idx.ids[i]
+            nbrs = list(self.idx.graph.get(cid, ())) + [s for s, ts in self.idx.cited_by.get(cid, ())
+                                                        if ts <= t]
+            for n in nbrs:
+                j = self.idx.pos.get(n)
+                if j is not None and ok[j]:
+                    exp[j] = max(exp.get(j, 0.0), 0.5 * fs[i])
+        fused = rrf([ranked_ids(fs), ranked_ids(exp)])
+        return self._emit_chain({i: v for i, v in fused.items() if ok[i]}, k,
+                                max(fs.values(), default=0.0))
+
+
 SCORERS: dict[str, type[Scorer]] = {c.name: c for c in
                                     [BM25Scorer, DenseScorer, HybridRRF,
-                                     HybridFresh, GraphBoost, CrossEncoderRerank]}
+                                     HybridFresh, GraphBoost, CrossEncoderRerank,
+                                     TwoStep, DagWalk]}
 
 # label sources that are derived from the record's link structure
 GRAPH_DERIVED_LABELS = {"dag_mined"}
