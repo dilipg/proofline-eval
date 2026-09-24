@@ -9,6 +9,7 @@
 #   "langfuse>=4.0",
 #   "sentence-transformers>=3.0",
 #   "adapters>=1.0",
+#   "anthropic>=1.8,<2",
 # ]
 # ///
 """
@@ -140,6 +141,10 @@ class Config:
     scale_judged_budget: int = 2000         # see branch3_scale: pinned-document budget
     abstain_fabr: float = 0.10             # matched false-abstention rate for calibration
     entities: bool = True                  # plant the typed entity layer (synthetic only)
+    walker: str = "mock"                   # onto_llm_walk: mock | anthropic:<model>
+    llm_queries: int = 80                  # cap on queries the LLM walker answers
+    extractor: str = "semantica:regex"     # which extraction the ontology scorers walk
+    b5_rerank: bool = False                # include the cross-encoder in B5 (downloads a model)
     baseline: str = "bm25"
     candidate: str = "hybrid_rrf"
     database_url: Optional[str] = None
@@ -2264,10 +2269,144 @@ class OntoWalk(Scorer):
         return self._emit_chain(scores, k, max(fs.values(), default=0.0))
 
 
+class LLMCache:
+    """(model, prompt) -> parsed reply, outside the database, so re-seeding never
+    re-bills a model for a prompt it has answered."""
+
+    def __init__(self, path: Path):
+        import sqlite3
+        import threading
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path), check_same_thread=False)
+        self.db.execute("CREATE TABLE IF NOT EXISTS x (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        self.db.commit()
+        self.lock = threading.Lock()
+
+    def get(self, k: str) -> Optional[dict]:
+        with self.lock:
+            r = self.db.execute("SELECT v FROM x WHERE k = ?", (k,)).fetchone()
+        return json.loads(r[0]) if r else None
+
+    def put(self, k: str, v: dict) -> None:
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO x VALUES (?, ?)", (k, json.dumps(v)))
+            self.db.commit()
+
+
+WALK_SCHEMA = {"type": "object",
+               "properties": {"next": {"type": "array", "items": {"type": "string"}},
+                              "done": {"type": "boolean"},
+                              "order": {"type": "array", "items": {"type": "string"}}},
+               "required": ["next", "done", "order"], "additionalProperties": False}
+WALK_SYSTEM = ("You follow evidence through a record of research cards to answer a question. "
+               "Only cards dated on or before the question's date exist. From the candidates, "
+               "choose the ids worth reading next; say whether the evidence so far answers the "
+               "question; and list every evidence id you rely on in chronological order.")
+
+
+class MockWalker:
+    """A plumbing stub, not a model: takes the three best-ranked candidates, stops after
+    two hops, orders evidence by date. It never sees gold, so its numbers are evidence
+    about the harness, never about a walker."""
+    errors = 0
+
+    def choose(self, question, as_of, evidence, candidates, hop):
+        chosen = [c["id"] for c in candidates[:3]]
+        seen = {e["id"]: e["date"] for e in evidence} | {c["id"]: c["date"] for c in candidates[:3]}
+        return {"next": chosen, "done": hop >= 1,
+                "order": sorted(seen, key=lambda i: (seen[i], i))}
+
+
+class AnthropicWalker:
+    """Claude through the official SDK, with schema-constrained JSON. Ids it invents are
+    dropped; a malformed reply, a refusal or an API error ends the walk and is counted."""
+
+    def __init__(self, model: str, client: Any = None, cache_path: Optional[Path] = None):
+        if client is None:
+            import anthropic
+            client = anthropic.Anthropic()
+        self.model, self.client, self.errors = model, client, 0
+        self.cache = LLMCache(cache_path or STATE_DIR / "cache" / "llm.sqlite")
+
+    def choose(self, question, as_of, evidence, candidates, hop):
+        lines = [f"Question (as of {as_of.date().isoformat()}): {question}", "", "Evidence so far:"]
+        lines += [f"- [{e['id']}] ({e['date']}) {e['text']}" for e in evidence]
+        lines += ["", "Candidates:"] + [f"- [{c['id']}] ({c['date']}) {c['text']}" for c in candidates]
+        prompt = "\n".join(lines)
+        key = hashlib.sha256(f"{self.model}\x00{prompt}".encode("utf-8")).hexdigest()
+        allowed = {e["id"] for e in evidence} | {c["id"] for c in candidates}
+        got = self.cache.get(key)
+        if got is None:
+            try:
+                r = self.client.messages.create(
+                    model=self.model, max_tokens=1024, system=WALK_SYSTEM,
+                    messages=[{"role": "user", "content": prompt}],
+                    output_config={"format": {"type": "json_schema", "schema": WALK_SCHEMA}})
+                if r.stop_reason != "end_turn":
+                    raise ValueError(f"stop_reason={r.stop_reason}")
+                got = json.loads(next(b.text for b in r.content if b.type == "text"))
+                self.cache.put(key, got)
+            except Exception:
+                self.errors += 1
+                return {"next": [], "done": True, "order": []}
+        cand_ids = {c["id"] for c in candidates}
+        return {"next": [i for i in got.get("next", []) if i in cand_ids],
+                "done": bool(got.get("done", True)),
+                "order": [i for i in got.get("order", []) if i in allowed]}
+
+
+def make_walker(spec: str):
+    if spec == "mock":
+        return MockWalker()
+    provider, _, model = spec.partition(":")
+    if provider == "anthropic" and model:
+        return AnthropicWalker(model)
+    raise SystemExit(f"unknown walker {spec!r}: use mock or anthropic:<model>")
+
+
+class OntoLlmWalk(Scorer):
+    """The ontology method with an LLM choosing each hop: up to three hops over the
+    as-of-masked ontology neighbourhood of the evidence so far. `order` from the walker
+    IS the chain; the harness never sorts it."""
+    name = "onto_llm_walk"
+    uses_ontology = True
+    description = "an LLM picks each next hop from the as-of-masked ontology neighbourhood."
+    walker: Any = None
+
+    def _card(self, i: int) -> dict:
+        r = self.idx.rows[self.idx.ids[i]]
+        return {"id": self.idx.ids[i], "date": r["committed_at"].date().isoformat(),
+                "text": r["txt"][:600]}
+
+    def run(self, q, k):
+        if self.idx.onto is None:
+            raise RuntimeError("onto_llm_walk needs an extraction: run ingest_semantica.py")
+        walker = self.walker or MockWalker()
+        ok = pool(self.idx, q)
+        fs = first_stage(self.idx, self.embedder, q)
+        evidence = ranked_ids(fs)[:3]
+        order: list[str] = []
+        for hop in range(3):
+            p = self.idx.onto.ppr({i: 1.0 for i in evidence}, q.as_of, q.intent,
+                                  self.idx.snapshot_mask(q.as_of))
+            cands = [int(i) for i in np.argsort(-p) if p[i] > 0 and ok[i] and int(i) not in evidence][:20]
+            reply = walker.choose(q.text, q.as_of, [self._card(i) for i in evidence],
+                                  [self._card(i) for i in cands], hop)
+            order = reply["order"] or order
+            evidence += [self.idx.pos[c] for c in reply["next"] if self.idx.pos[c] not in evidence]
+            if reply["done"] or not reply["next"]:
+                break
+        ranked = evidence + [i for i in ranked_ids(fs) if i not in evidence]
+        ids = [self.idx.ids[i] for i in ranked if ok[i]][:k]
+        chain = [c for c in order if c in ids] or ids
+        return Scored(ids, [1.0 / (r + 1) for r in range(len(ids))],
+                      max(fs.values(), default=0.0), chain)
+
+
 SCORERS: dict[str, type[Scorer]] = {c.name: c for c in
                                     [BM25Scorer, DenseScorer, HybridRRF,
                                      HybridFresh, GraphBoost, CrossEncoderRerank,
-                                     TwoStep, DagWalk, OntoWalk]}
+                                     TwoStep, DagWalk, OntoWalk, OntoLlmWalk]}
 
 # label sources that are derived from the record's link structure
 GRAPH_DERIVED_LABELS = {"dag_mined"}
@@ -3998,6 +4137,12 @@ scorers: """ + ", ".join(SCORERS) + """
     ap.add_argument("--no-langfuse", action="store_true")
     ap.add_argument("--no-entities", action="store_true",
                     help="skip the planted entity layer: reproduces the pre-P1 synthetic corpus")
+    ap.add_argument("--walker", default="mock",
+                    help="onto_llm_walk: mock, or anthropic:<model> (key read from .env)")
+    ap.add_argument("--llm-queries", type=int, default=80)
+    ap.add_argument("--extractor", default="semantica:regex",
+                    help="extraction source the ontology scorers walk (see ingest_semantica.py)")
+    ap.add_argument("--b5-rerank", action="store_true")
     ap.add_argument("--fresh", action="store_true",
                     help="re-seed and re-ingest before running")
     a = ap.parse_args(argv)
@@ -4015,7 +4160,9 @@ scorers: """ + ", ".join(SCORERS) + """
                  scale_judged_budget=a.scale_judged_budget,
                  target_effect=a.target_effect, baseline=a.baseline,
                  candidate=a.candidate, database_url=a.database_url,
-                 langfuse=not a.no_langfuse, entities=not a.no_entities)
+                 langfuse=not a.no_langfuse, entities=not a.no_entities,
+                 walker=a.walker, llm_queries=a.llm_queries, extractor=a.extractor,
+                 b5_rerank=a.b5_rerank)
 
     if a.cmd == "scorers":
         rule("SCORERS")
