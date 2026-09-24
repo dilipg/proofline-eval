@@ -1958,6 +1958,7 @@ class Scored:
     ids: list[str]
     scores: list[float]
     top_score: float          # used for the abstain decision (branch 3)
+    chain: Optional[list[str]] = None   # evidence in the order the scorer claims is time order
 
 
 class Scorer:
@@ -2190,6 +2191,31 @@ def bpref(ranked: Sequence[str], rel: dict[str, float], pool: set[str]) -> float
         elif c in pool:
             nonrel_seen += 1
     return total / R
+
+
+def slot_metrics(ranked: Sequence[str], slots: Sequence[set], k: int, family: Optional[str]) -> dict:
+    """Per-hop coverage of a multi-hop query. A slot is covered when ANY acceptable card
+    for that hop is in the top k; the chain is complete only when every slot is."""
+    top = set(ranked[:k])
+    covered = [bool(s & top) for s in slots]
+    return dict(slot_recall=sum(covered) / len(slots),
+                chain_recall=float(all(covered)),
+                last_hop_recall=float(covered[-1]) if family in LAST_HOP_FAMILIES else float("nan"))
+
+
+def chain_order(chain: Sequence[str], slots: Sequence[set], ts: dict[str, float]) -> tuple[float, float]:
+    """Kendall tau between where the scorer PUT each slot's evidence and when that
+    evidence was written. The harness never sorts a chain: a scorer that orders by
+    relevance is scored on the order it chose."""
+    found = []
+    for s in slots:
+        pos = next((p for p, c in enumerate(chain) if c in s), None)
+        if pos is not None:
+            found.append((pos, ts[chain[pos]]))
+    tau = kendall_tau([p for p, _t in found], [t for _p, t in found]) if len(found) >= 2 else float("nan")
+    complete = len(found) == len(slots)
+    exact = float(complete and (tau == 1.0 or len(found) < 2))
+    return tau, exact
 
 
 # ----------------------------------------------------------------------------------
@@ -2676,6 +2702,7 @@ class RunResult:
     top_score: dict[str, float]
     per_query: dict[str, dict[str, float]] = field(default_factory=dict)
     timing_ms: float = 0.0
+    chains: dict[str, list[str]] = field(default_factory=dict)
 
 
 def load_queries(store: Store, provenance: str, include_dropped: bool = False) -> list[Query]:
@@ -2744,6 +2771,7 @@ def execute_run(store: Store, scorer: Scorer, embedder: Embedder,
         t0 = time.perf_counter()
         ranked: dict[str, list[str]] = {}
         tops: dict[str, float] = {}
+        chains: dict[str, list[str]] = {}
         if queries:
             idx = build_index(store, corpus_n, keep)
             scorer.prepare(idx, embedder)
@@ -2755,13 +2783,15 @@ def execute_run(store: Store, scorer: Scorer, embedder: Embedder,
                 # and the hard check below would then be unfalsifiable.
                 if threshold is not None and out.top_score < threshold:
                     ranked[q.id] = []
+                    chains[q.id] = []
                 else:
                     ranked[q.id] = out.ids
+                    chains[q.id] = out.chain if out.chain is not None else list(out.ids)
         ms = (time.perf_counter() - t0) * 1000
         Tracer.set(obs, output=dict(queries=len(queries), ms=round(ms, 1),
                                     abstained=sum(1 for v in ranked.values() if not v)))
         return RunResult(scorer.name, label_src, corpus_n or 0, ranked, tops,
-                         timing_ms=ms)
+                         timing_ms=ms, chains=chains)
 
 
 def calibrate_abstain(store: Store, scorer: Scorer, embedder: Embedder,
@@ -2782,7 +2812,8 @@ def calibrate_abstain(store: Store, scorer: Scorer, embedder: Embedder,
     return float(np.quantile(vals, cfg.abstain_fabr))
 
 
-def score_runs(runs: list[RunResult], queries: Sequence[Query], k: int) -> None:
+def score_runs(runs: list[RunResult], queries: Sequence[Query], k: int,
+               ts: Optional[dict[str, float]] = None) -> None:
     """Second pass: build the judgment pool across all runs, then score. Pooling has to
     happen after every run exists, which is why metrics are not computed inline."""
     qmap = {q.id: q for q in queries}
@@ -2803,6 +2834,11 @@ def score_runs(runs: list[RunResult], queries: Sequence[Query], k: int) -> None:
                 recall=recall_at_k(ids, q.rel, k),
                 bpref=bpref(ids, q.rel, pool[qid]),
             )
+            if q.slots:
+                r.per_query[qid].update(slot_metrics(ids, q.slots, k, q.family))
+                if ts is not None:
+                    tau, exact = chain_order(r.chains.get(qid, ids), q.slots, ts)
+                    r.per_query[qid].update(order_tau=tau, order_exact=exact)
 
 
 def paired(a: RunResult, b: RunResult, metric: str,
@@ -2839,7 +2875,9 @@ def hard_checks(run: RunResult, idx_rows: dict, queries: Sequence[Query],
         seen_pos = {c: i for i, c in enumerate(top)}
         for c in top:
             s = succ_of.get(c)
-            if s is not None and s in seen_pos and seen_pos[s] > seen_pos[c]:
+            # history-intent queries are ASKING for superseded versions, in order
+            if (q.intent == "current" and s is not None and s in seen_pos
+                    and seen_pos[s] > seen_pos[c]):
                 superseded_above.append((qid, c, s))
             row = idx_rows.get(c)
             if row is not None and row["committed_at"] > q.as_of:
