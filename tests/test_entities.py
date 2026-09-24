@@ -49,7 +49,9 @@ def test_entity_layer_changes_only_bodies(quick_on):
         x, y = a.body.split(), b.body.split()
         assert y[:n] == x[:n] and y[len(y) - (len(x) - n):] == x[n:]
     q_off = {p: [(q.id, q.text, sorted(q.rel.items())) for q in qs] for p, qs in off.queries.items()}
-    q_on = {p: [(q.id, q.text, sorted(q.rel.items())) for q in qs] for p, qs in quick_on.queries.items()}
+    # multihop is ADDED by the entity layer (P2); every query set that existed before is untouched
+    q_on = {p: [(q.id, q.text, sorted(q.rel.items())) for q in qs] for p, qs in quick_on.queries.items()
+            if p != "multihop"}
     assert q_off == q_on
 
 

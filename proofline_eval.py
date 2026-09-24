@@ -110,13 +110,14 @@ load_dotenv(Path.cwd() / ".env")
 
 PROFILES = {
     # name        cards  prooflines  queries/source  scale points
-    "smoke": dict(cards=400, prooflines=18, n_queries=60, scale=[400]),
-    "quick": dict(cards=2500, prooflines=90, n_queries=220, scale=[2500]),
-    "full": dict(cards=12000, prooflines=420, n_queries=600, scale=[2500, 6000, 12000]),
+    "smoke": dict(cards=400, prooflines=18, n_queries=60, scale=[400], mh_queries=20),
+    "quick": dict(cards=2500, prooflines=90, n_queries=220, scale=[2500], mh_queries=150),
+    "full": dict(cards=12000, prooflines=420, n_queries=600, scale=[2500, 6000, 12000],
+                 mh_queries=400),
     # Real-record scale run. Pushes brute-force cosine (design position 7) to 60k x 768
     # -- ~184MB scanned per query -- which tests that position instead of asserting it.
     "arxiv-scale": dict(cards=60000, prooflines=0, n_queries=2000,
-                        scale=[6000, 20000, 60000]),
+                        scale=[6000, 20000, 60000], mh_queries=0),
 }
 
 
@@ -247,6 +248,11 @@ class Query:
     rel: dict[str, float]           # card_id -> graded relevance (0 excluded)
     slices: list[str]
     answerable: bool
+    intent: str = "current"         # current | history (declared, like as_of)
+    family: Optional[str] = None    # multihop family, or None for the older provenances
+    slots: list = field(default_factory=list)      # [set of acceptable card ids] per hop
+    answer: Optional[dict] = None   # gold answer (P3 scores it); multihop only
+    pair_id: Optional[str] = None   # contrast group: twins, chrono halves, aggregate pairs
 
 
 @dataclass
@@ -349,7 +355,9 @@ CHAIN_REPORT_P = 0.9
 CHAIN_CHANGE_P = 0.8
 # Methods reported on several datasets feed aggregate_set; single-dataset methods feed
 # every other family (their answers must have one referent). P2 tunes this share.
-MULTI_DATASET_P = 0.3
+MULTI_DATASET_P = 0.35
+# Methods that extend an earlier one feed bridge3 (one more hop, through `extends`).
+EXTENDS_P = 0.45
 
 
 def plant_entities(cards: list[Card], vocab: set[str], seed: int
@@ -497,7 +505,7 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
             say(v, tpl, [(mid, name, "introduces")], e=name, k=_KIND_WORD[kind])
 
         older = [m for m in intro_of if m != mid and intro_of[m].committed_at < intro.committed_at]
-        if older and rng.random() < 0.3:
+        if older and rng.random() < EXTENDS_P:
             m2 = rng.choice(older)
             tpl = rng.choice(_SAY["extends"])
             for v in versions(intro):
@@ -592,6 +600,256 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
     out["true_mentions"] = sum(len(c.true_mentions) for c in cards)
     out["true_facts"] = sum(len(c.true_facts) for c in cards)
     return ents, out
+
+
+# ---- multi-hop queries (P2) -------------------------------------------------------
+#
+# Composed from the planted entity layer, MuSiQue-style. A question speaks in card A's
+# own vocabulary (paraphrased) plus a relation cue, and never names the bridge entity,
+# so the answer's card is reachable only through the entity A uses. Gold is a set of
+# card VERSIONS valid at the question's as_of, one set per hop, and the answer itself
+# is stored so P3 can score answers without re-deriving them. Its own random stream
+# (seed + 2), after everything else: no other query set moves.
+# ----------------------------------------------------------------------------------
+
+MH_FAMILIES = ("bridge", "bridge3", "chrono_asof", "timeline", "history",
+               "aggregate_set", "aggregate_count")
+LAST_HOP_FAMILIES = ("bridge", "bridge3", "chrono_asof")
+_MH_CUE = {
+    "bridge": "what score did the method used here reach on its {kind}",
+    "bridge3": "what score did the method that the approach used here extends reach on its {kind}",
+    "chrono_asof": "what score did the method used here reach on its {kind}",
+    "timeline": "how have reported results for the method used here changed over time",
+    "history": "what did the reported result for the method used here read before it was revised",
+    "aggregate_set": "which datasets have results been reported on for the method used here",
+    "aggregate_count": "how many results have been reported for the method used here",
+}
+
+
+def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int, seed: int,
+                           topk: int) -> tuple[list[Query], dict]:
+    rng = random.Random(seed + 2)
+    by_id = {c.id: c for c in cards}
+    succ = {c.supersedes_id: c for c in cards if c.supersedes_id}
+    end = max(c.committed_at for c in cards)
+    kind = {e[0]: e[2] for e in entities}
+    ename = {e[0]: e[1] for e in entities}
+    minute = timedelta(minutes=1)
+
+    def root_of(c: Card) -> Card:
+        while c.supersedes_id:
+            c = by_id[c.supersedes_id]
+        return c
+
+    def chain(root: Card) -> list[Card]:
+        out = [root]
+        while out[-1].id in succ:
+            out.append(succ[out[-1].id])
+        return out
+
+    def valid(c: Card, t: datetime) -> bool:
+        nxt = succ.get(c.id)
+        return c.committed_at <= t and (nxt is None or nxt.committed_at > t)
+
+    def version_at(root: Card, t: datetime) -> Optional[Card]:
+        return next((v for v in chain(root) if valid(v, t)), None)
+
+    reports: dict[str, list[tuple[Card, str, str]]] = defaultdict(list)
+    users: dict[str, dict[str, Card]] = defaultdict(dict)
+    extends: dict[str, tuple[Card, str]] = {}
+    for c in cards:
+        for s, r, o, v in c.true_facts:
+            if r == "reports":
+                reports[s].append((c, o, v))
+            elif r == "extends" and c.supersedes_id is None:
+                extends.setdefault(s, (c, o))
+        if c.supersedes_id is None:
+            for e, _surf, role in c.true_mentions:
+                if role == "uses" and top_class(kind[e]) == "Method":
+                    users[e][c.id] = c
+
+    def reports_at(m: str, t: datetime) -> dict[str, tuple[Card, str, str]]:
+        """Report facts of `m` valid at t, one per reporting card chain (keyed by root)."""
+        return {root_of(c).id: (c, d, v) for c, d, v in reports[m] if valid(c, t)}
+
+    def first_report(m: str) -> Optional[datetime]:
+        return min((c.committed_at for c, _d, _v in reports[m]), default=None)
+
+    def latest(m: str, t: datetime) -> Optional[tuple[Card, str, str]]:
+        r = reports_at(m, t)
+        if not r or len({d for _c, d, _v in r.values()}) != 1:
+            return None
+        return max(r.values(), key=lambda x: (x[0].committed_at, x[0].id))
+
+    def stale(m: str, d: str, t: datetime) -> list[str]:
+        return sorted({v for c, dd, v in reports[m]
+                       if dd == d and c.id in succ and succ[c.id].committed_at <= t})
+
+    def question(a: Card, cue: str) -> str:
+        own = [w for w in a.terms if w not in a.inherited_terms] or a.terms
+        pick = rng.sample(own, k=min(len(own), rng.randrange(4, 8)))
+        return " ".join(_paraphrase(pick, rng)) + " " + cue
+
+    def linked(a: Card, gold: Card) -> bool:
+        return gold.id in (a.parent_ids + a.citation_ids) and gold.committed_at <= a.committed_at
+
+    def alias_used(gold: Card, m: str) -> bool:
+        return any(e == m and s != ename[m] for e, s, _r in gold.true_mentions)
+
+    out: list[Query] = []
+    stats: Counter = Counter()
+    cap = 2 * target
+
+    def emit(family: str, a: Card, t: datetime, slots: list[set], answer: dict,
+             text: str, intent: str = "current", pair_id: Optional[str] = None,
+             gold: Optional[Card] = None) -> Optional[Query]:
+        flat = [cid for s in slots for cid in s]
+        if len(flat) != len(set(flat)):
+            stats["skipped_shared_card"] += 1
+            return None
+        slices = [family, "hops3" if family == "bridge3" else "hops2"]
+        if gold is not None and family in LAST_HOP_FAMILIES:
+            slices.append("linked" if linked(a, gold) else "unlinked")
+            if alias_used(gold, answer["_m"]):
+                slices.append("alias")
+            if gold.proofline_id != a.proofline_id:
+                slices.append("cross_project")
+        if family.startswith("aggregate") and len(slots) - 1 > topk:
+            slices.append("set_gt_k")
+        answer = {k: v for k, v in answer.items() if not k.startswith("_")}
+        q = Query(id=f"q_mh_{family}_{stats[family]:05d}", text=text, provenance="multihop",
+                  as_of=t, source_card=a.id, rel={cid: 2.0 for cid in flat}, slices=slices,
+                  answerable=True, intent=intent, family=family, slots=slots, answer=answer,
+                  pair_id=pair_id)
+        stats[family] += 1
+        out.append(q)
+        return q
+
+    def twin(q: Query, a_root: Card, m: str) -> None:
+        f = first_report(m)
+        if f is None or a_root.committed_at >= f:
+            return
+        t = a_root.committed_at + (f - a_root.committed_at) / 2
+        a = version_at(a_root, t)
+        if a is None:
+            return
+        q.pair_id = q.id
+        out.append(Query(id=f"{q.id}_twin", text=q.text, provenance="multihop", as_of=t,
+                         source_card=a.id, rel={}, slices=["no_answer", "twin"],
+                         answerable=False, family="twin", pair_id=q.id))
+        stats["twin"] += 1
+
+    pairs = [(m, u) for m in sorted(users) if reports[m] for u in sorted(users[m])]
+    rng.shuffle(pairs)
+
+    for m, uid in pairs:
+        a_root = users[m][uid]
+        lower = max(a_root.committed_at, first_report(m))
+
+        if stats["bridge"] < cap:
+            t = min(end, lower + timedelta(days=rng.randrange(0, 60)))
+            a, got = version_at(a_root, t), latest(m, t)
+            if a and got and root_of(got[0]).id != a_root.id:
+                g, d, v = got
+                q = emit("bridge", a, t, [{a.id}, {g.id}],
+                         {"value": v, "stale": stale(m, d, t), "_m": m},
+                         question(a, _MH_CUE["bridge"].format(kind=_KIND_WORD[kind[d]])), gold=g)
+                if q:
+                    twin(q, a_root, m)
+
+        if stats["chrono_asof"] < cap:
+            events = sorted({c.committed_at for c, _d, _v in reports[m]} |
+                            {succ[c.id].committed_at for c, _d, _v in reports[m] if c.id in succ})
+            for e in events:
+                t1, t2 = e - minute, e + minute
+                if t1 < lower or t2 > end:
+                    continue
+                r1, r2 = latest(m, t1), latest(m, t2)
+                a1, a2 = version_at(a_root, t1), version_at(a_root, t2)
+                if not (r1 and r2 and a1 and a2) or r1[2] == r2[2] or r1[1] != r2[1]:
+                    continue
+                if root_of(r1[0]).id == a_root.id or root_of(r2[0]).id == a_root.id:
+                    continue
+                text = question(a2, _MH_CUE["chrono_asof"].format(kind=_KIND_WORD[kind[r1[1]]]))
+                pid = f"pair_chrono_{stats['chrono_asof']:05d}"
+                emit("chrono_asof", a1, t1, [{a1.id}, {r1[0].id}],
+                     {"value": r1[2], "stale": stale(m, r1[1], t1), "_m": m}, text,
+                     pair_id=pid, gold=r1[0])
+                emit("chrono_asof", a2, t2, [{a2.id}, {r2[0].id}],
+                     {"value": r2[2], "stale": stale(m, r2[1], t2), "_m": m}, text,
+                     pair_id=pid, gold=r2[0])
+                break
+
+        if stats["timeline"] < cap:
+            a, r = version_at(a_root, end), reports_at(m, end)
+            if a and len(r) >= 2 and len({d for _c, d, _v in r.values()}) == 1:
+                rs = sorted(r.values(), key=lambda x: (x[0].committed_at, x[0].id))
+                emit("timeline", a, end, [{a.id}] + [{c.id} for c, _d, _v in rs],
+                     {"values": [v for _c, _d, v in rs]},
+                     question(a, _MH_CUE["timeline"]))
+
+        if stats["history"] < cap:
+            changed = [root_of(c) for c, _d, _v in reports[m]]
+            roots = {r.id: r for r in changed if len({v for c, _d, v in reports[m]
+                                                      if root_of(c).id == r.id}) > 1}
+            ds = {d for _c, d, _v in reports[m]}
+            if len(roots) == 1 and len(ds) == 1:
+                (rroot,) = roots.values()
+                last = chain(rroot)[-1]
+                t = min(end, max(last.committed_at, a_root.committed_at) + timedelta(days=rng.randrange(0, 30)))
+                a = version_at(a_root, t)
+                vs = [v for v in chain(rroot) if v.committed_at <= t]
+                vals = [next(val for s, r_, _o, val in v.true_facts if s == m and r_ == "reports")
+                        for v in vs]
+                if a and rroot.id != a_root.id and len(set(vals)) > 1:
+                    emit("history", a, t, [{a.id}] + [{v.id} for v in vs], {"values": vals},
+                         question(a, _MH_CUE["history"]), intent="history")
+
+        for fam in ("aggregate_set", "aggregate_count"):
+            if stats[fam] >= cap:
+                continue
+            a, r = version_at(a_root, end), reports_at(m, end)
+            if not a or not 2 <= len(r) <= topk - 1:
+                continue
+            by_d: dict[str, set] = defaultdict(set)
+            for c, d, _v in r.values():
+                by_d[d].add(c.id)
+            if fam == "aggregate_set" and not 2 <= len(by_d) <= 8:
+                continue
+            if fam == "aggregate_set":
+                order = sorted(by_d, key=lambda d: min(by_id[c].committed_at for c in by_d[d]))
+                slots = [{a.id}] + [by_d[d] for d in order]
+                answer = {"set": sorted(ename[d] for d in order)}
+            else:
+                slots = [{a.id}] + [{c.id} for c, _d, _v in
+                                    sorted(r.values(), key=lambda x: x[0].committed_at)]
+                answer = {"count": len(r)}
+            emit(fam, a, end, slots, answer, question(a, _MH_CUE[fam]))
+
+    for m1, (c_root, m2) in sorted(extends.items()):
+        if stats["bridge3"] >= cap:
+            break
+        if not reports[m2]:
+            continue
+        for uid in sorted(users.get(m1, {})):
+            if stats["bridge3"] >= cap:
+                break
+            a_root = users[m1][uid]
+            lower = max(a_root.committed_at, c_root.committed_at, first_report(m2))
+            t = min(end, lower + timedelta(days=rng.randrange(0, 60)))
+            a, c, got = version_at(a_root, t), version_at(c_root, t), latest(m2, t)
+            if not (a and c and got):
+                continue
+            g, d, v = got
+            if len({a_root.id, c_root.id, root_of(g).id}) < 3:
+                continue
+            q = emit("bridge3", a, t, [{a.id}, {c.id}, {g.id}],
+                     {"value": v, "stale": stale(m2, d, t), "_m": m2},
+                     question(a, _MH_CUE["bridge3"].format(kind=_KIND_WORD[kind[d]])), gold=g)
+            if q:
+                twin(q, a_root, m2)
+
+    return out, dict(stats)
 
 
 def build_corpus(cfg: Config, n_cards: int, n_prooflines: int) -> Corpus:
@@ -843,6 +1101,11 @@ def build_corpus(cfg: Config, n_cards: int, n_prooflines: int) -> Corpus:
 
     entities, ent_stats = (plant_entities(cards, {w for ws in topics.values() for w in ws},
                                           cfg.seed) if cfg.entities else ([], {}))
+    if cfg.entities and cfg.p.get("mh_queries"):
+        mh, mh_stats = build_multihop_queries(cards, entities, cfg.p["mh_queries"], cfg.seed,
+                                              cfg.topk)
+        queries["multihop"] = mh
+        ent_stats = {**ent_stats, "multihop": mh_stats}
     stats = {
         "cards": len(cards),
         "current_cards": sum(1 for c in cards if c.is_current),
