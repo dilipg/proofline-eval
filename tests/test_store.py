@@ -1,3 +1,6 @@
+import proofline_eval as pe
+
+
 def one(store, sql, *args):
     with store.conn.cursor() as cur:
         cur.execute(sql, args)
@@ -28,3 +31,14 @@ def test_reset_drops_the_new_tables(store, smoke_corpus):
     store.init(reset=True)
     assert one(store, "SELECT count(*) FROM true_mentions") == 0
     store.load_corpus(smoke_corpus)          # leave the session DB seeded for later tests
+
+
+def test_opening_an_existing_database_adds_what_this_version_indexes(seeded):
+    # SCHEMA used to run only at seed time, so a database seeded before cards_sup existed
+    # ran the DAG walk's version step as a sequential scan
+    with seeded.conn.cursor() as cur:
+        cur.execute("DROP INDEX IF EXISTS cards_sup")
+    n, _e, ok = pe.probe_store(seeded)
+    with seeded.conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = 'cards_sup'")
+        assert cur.fetchone() and ok and n > 0

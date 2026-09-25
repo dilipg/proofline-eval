@@ -96,3 +96,13 @@ def test_dag_sql_version_chain_costs_no_hop(dag_db):
     spec = [("P", 5, "p", None), ("Q", 1, "q", None), ("Q2", 2, "q2", "Q"), ("Q3", 3, "q3", "Q2")]
     load_dag(dag_db, spec, [("P", "Q", 5)])
     assert pe.dag_neighbourhood(dag_db, ["P"], day(6), hops=1)[0] == {"P": 0, "Q": 1, "Q2": 1, "Q3": 1}
+
+
+def test_dag_walk_refuses_a_scale_point_subset(dag_db):
+    # the CTE walks the whole edges table; at a B3 scale point the index holds only part
+    # of the record, and walking through cards outside it would break invariant 5
+    load_dag(dag_db, SPEC, LINKS)
+    sc = pe.DagWalk()
+    sc.prepare(index_from(SPEC[:3]), EMB, SimpleNamespace(conn=dag_db))
+    with pytest.raises(SystemExit, match="scale point"):
+        sc.run(query("quanibraion", 6), 3)

@@ -518,7 +518,10 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
         if older and rng.random() < EXTENDS_P:
             m2 = rng.choice(older)
             if want_linked and intro_of[m2].id not in intro.parent_ids + intro.citation_ids:
-                intro.citation_ids.append(intro_of[m2].id)      # an extension cites its origin
+                # an extension cites its origin, and rests on it: support, not noise
+                intro.citation_ids.append(intro_of[m2].id)
+                if intro_of[m2].id not in intro.true_support:
+                    intro.true_support.append(intro_of[m2].id)
                 stats["citations_added"] += 1
             tpl = rng.choice(_SAY["extends"])
             for v in versions(intro):
@@ -581,7 +584,12 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
         if linked_m:
             for r in uniq(users + reporters):
                 if r is not intro and intro.id not in r.parent_ids + r.citation_ids:
+                    # a card that uses or reports a method rests on the paper that
+                    # introduced it, so the citation is planted support too: otherwise B1
+                    # would grade it as author noise (link precision 0.964 -> 0.748)
                     r.citation_ids.append(intro.id)
+                    if intro.id not in r.true_support:
+                        r.true_support.append(intro.id)
                     stats["citations_added"] += 1
         for j, r in enumerate(uniq(reporters)):
             d = ds[j % len(ds)]
@@ -2419,9 +2427,22 @@ class DagWalk(Scorer):
     time_blind = False
     description = "first stage, then PPR over the as-of DAG neighbourhood a Postgres recursive CTE fetches."
 
+    def prepare(self, idx, embedder, store=None):
+        super().prepare(idx, embedder, store)
+        self.subset = False
+        if store is not None:
+            with store.conn.cursor() as cur:
+                cur.execute("SELECT count(*) AS n FROM cards")
+                self.subset = cur.fetchone()["n"] != len(idx.ids)
+
     def run(self, q, k):
         if getattr(self, "store", None) is None:
             raise SystemExit(f"{self.name} walks the edges table in Postgres: prepare it with a store")
+        if self.subset:
+            # the CTE walks the whole edges table: at a B3 scale point it would pass
+            # through cards that smaller record does not hold (invariant 5)
+            raise SystemExit(f"{self.name} walks the whole record, not a B3 scale point: "
+                             f"use it in B5, or at the full corpus size")
         ok = pool(self.idx, q)
         snap = self.idx.snapshot_mask(q.as_of)
         fs = first_stage(self.idx, self.embedder, q)
@@ -4478,6 +4499,27 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
 # §12  CLI
 # ----------------------------------------------------------------------------------
 
+def probe_store(store: Store) -> tuple[int, int, bool]:
+    """(cards, embedded cards, compatible). A database seeded before edges carried
+    valid_from is an older schema, not a corpus: the caller re-seeds it rather than
+    half-read it. A compatible one gets this version's schema applied (every statement is
+    IF NOT EXISTS), so an index added since it was seeded exists before a branch runs."""
+    with store.conn.cursor() as cur:
+        try:
+            cur.execute("SELECT count(*) n, count(embedding) e FROM cards")
+            r = cur.fetchone()
+            cur.execute("SELECT valid_from FROM edges LIMIT 0")
+            cur.execute("SELECT 1 FROM true_mentions LIMIT 0")
+            cur.execute("SELECT intent, family, answer, pair_id, dropped FROM queries LIMIT 0")
+            cur.execute("SELECT slot FROM qrels LIMIT 0")
+        except psycopg.Error:
+            # a table left over from an older schema is not a corpus; start clean
+            store.conn.rollback()
+            return 0, 0, False
+    store.init()
+    return r["n"], r["e"], True
+
+
 def cmd_seed(store: Store, cfg: Config, embedder: Embedder, tracer: Tracer) -> Corpus:
     p = cfg.p
     if cfg.source == "arxiv":
@@ -4666,22 +4708,7 @@ scorers: """ + ", ".join(SCORERS) + """
     rule(f"proofline_eval  profile={cfg.profile}  embedder={embedder.name}  "
          f"A={cfg.baseline}  B={cfg.candidate}", ch="=")
 
-    n_cards = n_emb = 0
-    compatible = False
-    with store.conn.cursor() as cur:
-        try:
-            cur.execute("SELECT count(*) n, count(embedding) e FROM cards")
-            r = cur.fetchone()
-            # A DB seeded before edges carried valid_from is an older schema, not a
-            # corpus: re-seed it rather than half-read it.
-            cur.execute("SELECT valid_from FROM edges LIMIT 0")
-            cur.execute("SELECT 1 FROM true_mentions LIMIT 0")
-            cur.execute("SELECT intent, family, answer, pair_id, dropped FROM queries LIMIT 0")
-            cur.execute("SELECT slot FROM qrels LIMIT 0")
-            n_cards, n_emb, compatible = r["n"], r["e"], True
-        except psycopg.Error:
-            # a table left over from an older schema is not a corpus; start clean
-            store.conn.rollback()
+    n_cards, n_emb, compatible = probe_store(store)
 
     need_seed = a.fresh or not compatible or n_cards == 0
     if a.cmd in ("all", "seed") or need_seed:

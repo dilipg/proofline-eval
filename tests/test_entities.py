@@ -45,11 +45,14 @@ def test_entity_layer_changes_bodies_and_only_adds_citations_to_introducers(quic
     by_on = {c.id: c for c in quick_on.cards}
     assert [c.id for c in off.cards] == [c.id for c in quick_on.cards]
     for a, b in zip(off.cards, quick_on.cards):
-        assert (a.title, a.one_line, a.committed_at, a.parent_ids, a.true_support) == \
-               (b.title, b.one_line, b.committed_at, b.parent_ids, b.true_support)
-        # the layer only APPENDS citations: a linked method's cards cite its introducer
+        assert (a.title, a.one_line, a.committed_at, a.parent_ids) == \
+               (b.title, b.one_line, b.committed_at, b.parent_ids)
+        # the layer only APPENDS citations: a linked method's cards cite its introducer,
+        # and that citation is genuine support, so it is planted support too
         assert b.citation_ids[:len(a.citation_ids)] == a.citation_ids
-        for d in b.citation_ids[len(a.citation_ids):]:
+        added = b.citation_ids[len(a.citation_ids):]
+        assert b.true_support == a.true_support + [d for d in added if d not in a.true_support]
+        for d in added:
             assert by_on[d].committed_at < b.committed_at, (b.id, d)
             assert any(r == "introduces" for _e, _s, r in by_on[d].true_mentions), (b.id, d)
         x, y = a.body.split(), b.body.split()
@@ -151,3 +154,14 @@ def test_enough_revisions_change_a_reported_value(quick_on):
     changed = sum(1 for n in per_method.values() if n == 1)
     assert changed >= 150, changed
     assert quick_on.stats["chain_reporters"] > 0
+
+
+def link_precision(corpus):
+    links = [(c, d) for c in corpus.cards for d in c.parent_ids + c.citation_ids]
+    return sum(d in c.true_support for c, d in links) / len(links)
+
+
+def test_planted_citations_do_not_look_like_spurious_links(quick_on):
+    # B1 grades recorded links against planted support: a planted citation that were not
+    # support would read as author noise (measured: 0.964 -> 0.748 on quick)
+    assert link_precision(quick_on) >= link_precision(build("quick", False)) - 0.01
