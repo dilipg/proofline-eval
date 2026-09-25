@@ -1998,6 +1998,23 @@ class Index:
         return self.emb @ qvec.astype(np.float32)
 
 
+def ppr_walk(size: int, src: np.ndarray, dst: np.ndarray, p0: np.ndarray,
+             iters: int = 20, alpha: float = 0.5) -> np.ndarray:
+    """Personalized PageRank over directed edge arrays; pass both directions for an
+    undirected graph. The ontology walk and the DAG walk both rank with THIS function,
+    so B5 compares two graphs under one walk rather than two walks. alpha is HippoRAG's
+    restart weight."""
+    if p0.sum() == 0:
+        return np.zeros(size)
+    p0 = p0 / p0.sum()
+    deg = np.bincount(src, minlength=size).astype(np.float64)
+    w = 1.0 / np.maximum(deg[src], 1.0)
+    p = p0.copy()
+    for _ in range(iters):
+        p = alpha * p0 + (1 - alpha) * np.bincount(dst, weights=p[src] * w, minlength=size)
+    return p
+
+
 class OntologyIndex:
     """Cards and extracted entities as ONE graph, masked per query exactly like the rest
     of the index. Node i < n is the card idx.ids[i]; node n + j is entity j. Mention
@@ -2022,28 +2039,24 @@ class OntologyIndex:
         self.size = self.n + len(self.ent_ids)
 
     def ppr(self, seed: dict[int, float], as_of: datetime, intent: str, card_ok: np.ndarray,
-            iters: int = 20, alpha: float = 0.5) -> np.ndarray:
+            iters: int = 20, alpha: float = 0.5, time_blind: bool = False) -> np.ndarray:
         """Personalized PageRank from `seed` over the edges that existed at as_of (for a
         current-intent question, facts also must not have expired). Masked nodes hold
-        and pass no mass. alpha is HippoRAG's restart weight."""
+        and pass no mass. time_blind is the ablation: every edge and every card may carry
+        mass, whatever its date; the caller still masks what it returns."""
         t = as_of.timestamp()
-        ok_edge = (self.t0 <= t) & ((self.t1 > t) if intent == "current" else True)
-        node_ok = np.concatenate([card_ok, np.ones(len(self.ent_ids), dtype=bool)])
+        if time_blind:
+            ok_edge = np.ones(len(self.src), dtype=bool)
+            node_ok = np.ones(self.size, dtype=bool)
+        else:
+            ok_edge = (self.t0 <= t) & ((self.t1 > t) if intent == "current" else True)
+            node_ok = np.concatenate([card_ok, np.ones(len(self.ent_ids), dtype=bool)])
         ok_edge &= node_ok[self.src] & node_ok[self.dst]
-        s, d = self.src[ok_edge], self.dst[ok_edge]
-        deg = np.bincount(s, minlength=self.size).astype(np.float64)
-        w = 1.0 / np.maximum(deg[s], 1.0)
         p0 = np.zeros(self.size)
         for i, v in seed.items():
             if card_ok[i]:
                 p0[i] = v
-        if p0.sum() == 0:
-            return np.zeros(self.n)
-        p0 /= p0.sum()
-        p = p0.copy()
-        for _ in range(iters):
-            p = alpha * p0 + (1 - alpha) * np.bincount(d, weights=p[s] * w, minlength=self.size)
-        return p[:self.n]
+        return ppr_walk(self.size, self.src[ok_edge], self.dst[ok_edge], p0, iters, alpha)[:self.n]
 
 
 def rrf(rankings: Sequence[Sequence[int]], k: int = 60) -> dict[int, float]:
