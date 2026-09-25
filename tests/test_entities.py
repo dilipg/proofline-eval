@@ -39,13 +39,19 @@ def test_no_entities_reproduces_todays_corpus(profile):
     assert c.entities == [] and all(not x.true_mentions and not x.true_facts for x in c.cards)
 
 
-def test_entity_layer_changes_only_bodies(quick_on):
+def test_entity_layer_changes_bodies_and_only_adds_citations_to_introducers(quick_on):
     off = build("quick", False)
     n = len(pe.CONNECTIVE)
+    by_on = {c.id: c for c in quick_on.cards}
     assert [c.id for c in off.cards] == [c.id for c in quick_on.cards]
     for a, b in zip(off.cards, quick_on.cards):
-        assert (a.title, a.one_line, a.committed_at, a.parent_ids, a.citation_ids, a.true_support) == \
-               (b.title, b.one_line, b.committed_at, b.parent_ids, b.citation_ids, b.true_support)
+        assert (a.title, a.one_line, a.committed_at, a.parent_ids, a.true_support) == \
+               (b.title, b.one_line, b.committed_at, b.parent_ids, b.true_support)
+        # the layer only APPENDS citations: a linked method's cards cite its introducer
+        assert b.citation_ids[:len(a.citation_ids)] == a.citation_ids
+        for d in b.citation_ids[len(a.citation_ids):]:
+            assert by_on[d].committed_at < b.committed_at, (b.id, d)
+            assert any(r == "introduces" for _e, _s, r in by_on[d].true_mentions), (b.id, d)
         x, y = a.body.split(), b.body.split()
         assert y[:n] == x[:n] and y[len(y) - (len(x) - n):] == x[n:]
     q_off = {p: [(q.id, q.text, sorted(q.rel.items())) for q in qs] for p, qs in off.queries.items()}

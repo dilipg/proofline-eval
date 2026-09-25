@@ -31,7 +31,7 @@ def test_dag_sql_supersession_only_as_of(dag_db):
     spec = SPEC + [("B2", 8, "thermoulaity caltroposis isostabity revised", "B")]
     load_dag(dag_db, spec, LINKS)
     assert "B2" not in pe.dag_neighbourhood(dag_db, ["A"], day(6))[0]
-    assert pe.dag_neighbourhood(dag_db, ["A"], day(8))[0]["B2"] == 2   # A - B - B2
+    assert pe.dag_neighbourhood(dag_db, ["A"], day(8))[0]["B2"] == 1   # A - B, and B2 is B
 
 
 def test_dag_sql_stops_at_the_hop_cap_on_a_cycle(dag_db):
@@ -89,3 +89,10 @@ def test_dag_walk_without_a_store_says_so():
     sc.prepare(index_from(SPEC), EMB)
     with pytest.raises(SystemExit, match="Postgres"):
         sc.run(query("quanibraion", 6), 3)
+
+
+def test_dag_sql_version_chain_costs_no_hop(dag_db):
+    # P cites Q; Q has versions Q2, Q3: all of Q's versions sit one hop from P
+    spec = [("P", 5, "p", None), ("Q", 1, "q", None), ("Q2", 2, "q2", "Q"), ("Q3", 3, "q3", "Q2")]
+    load_dag(dag_db, spec, [("P", "Q", 5)])
+    assert pe.dag_neighbourhood(dag_db, ["P"], day(6), hops=1)[0] == {"P": 0, "Q": 1, "Q2": 1, "Q3": 1}

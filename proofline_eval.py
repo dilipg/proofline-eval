@@ -73,7 +73,7 @@ import re
 import statistics
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field, asdict, replace
 from itertools import cycle
@@ -298,8 +298,12 @@ def _paraphrase(terms: Sequence[str], rng: random.Random) -> list[str]:
 # planted tables.
 #
 # It runs after the queries are built and draws from its own random stream, so
-# --no-entities reproduces the corpus byte for byte. No edge is ever added: a "linked"
-# placement reuses a citation that already exists.
+# --no-entities reproduces the corpus byte for byte. With the layer on it ADDS citations:
+# a "linked" method's users and reporters cite the card that introduced it, as a real
+# paper reporting a method cites its origin. The record's own citations are far too
+# sparse to hold a multi-hop chain (70 revisions in 2,500 quick cards, 42 cited roots
+# with a revised citer), and without these the DAG method could reach 3% of B5's
+# questions: the generator, not the ingestion, would pick the winner.
 # ----------------------------------------------------------------------------------
 
 ONTO_CLASSES: dict[str, Optional[str]] = {
@@ -357,6 +361,7 @@ _SAY: dict[str, tuple[str, ...]] = {
 # revisions. Left to chance, a reporter lands on a version chain ~4% of the time, so most
 # methods get one reporter placed on a chain, and that reporter's value changes more often.
 CHAIN_REPORT_P = 0.9
+LINKED_P = 0.5          # methods whose users and reporters sit in the DAG around its introducer
 CHAIN_CHANGE_P = 0.8
 # Methods reported on several datasets feed aggregate_set; single-dataset methods feed
 # every other family (their answers must have one referent). P2 tunes this share.
@@ -493,7 +498,7 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
         avoid = intro_of[sibling].topic if sibling else None
         # decide linked vs unlinked BEFORE choosing the introducer: a linked bridge needs
         # an introducer somebody later cites, and most cards are cited by nobody
-        want_linked = rng.random() < 0.5
+        want_linked = rng.random() < LINKED_P
         cands = [r for r in nonseed if avoid is None or r.topic != avoid] or nonseed
         linkable = [r for r in cands if r.id in cited] if want_linked else []
         intro = rng.choice(linkable or cands)
@@ -512,6 +517,9 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
         older = [m for m in intro_of if m != mid and intro_of[m].committed_at < intro.committed_at]
         if older and rng.random() < EXTENDS_P:
             m2 = rng.choice(older)
+            if want_linked and intro_of[m2].id not in intro.parent_ids + intro.citation_ids:
+                intro.citation_ids.append(intro_of[m2].id)      # an extension cites its origin
+                stats["citations_added"] += 1
             tpl = rng.choice(_SAY["extends"])
             for v in versions(intro):
                 say(v, tpl, [(mid, name, "mentions"), (m2, name_of[m2], "mentions")],
@@ -542,7 +550,17 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
                         and intro.id not in nbrs[r.id] and not (nbrs[r.id] & far)]
             a_card = rng.choice(unlinked or later)
         stats["bridges_linked" if intro.id in cites[a_card.id] else "bridges_unlinked"] += 1
-        users = uniq([a_card] + rng.sample(later, k=min(len(later), rng.randrange(0, 4))))
+        # A linked method is cited by the cards that use it and report on it, as a real
+        # paper reporting a method cites the paper that introduced it: asker -> introducer
+        # <- reporter is two hops along the DAG. An unlinked method's cards stay away from
+        # the introducer's neighbourhood, so only the shared entity connects them.
+        # A linked method's cards all cite its introducer (added below if the record
+        # lacks the citation): asker -> introducer <- reporter is two hops. An unlinked
+        # method's cards stay out of the introducer's neighbourhood, so only the shared
+        # entity connects them.
+        linked_m = intro.id in cites[a_card.id]
+        pool_m = later if linked_m else ([r for r in later if intro.id not in nbrs[r.id]] or later)
+        users = uniq([a_card] + rng.sample(pool_m, k=min(len(pool_m), rng.randrange(0, 4))))
         for u in users:
             surface = rng.choice(aliases) if aliases and rng.random() < 0.5 else name
             tpl = rng.choice(_SAY["uses"])
@@ -550,13 +568,21 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
                 say(v, tpl, [(mid, surface, "uses")], e=surface)
 
         k_more = rng.randrange(0, 4) + (len(ds) if multi else 0)
-        reporters = ([intro] if rng.random() < 0.6 else []) + rng.sample(later, k=min(len(later), k_more))
+        reporters = ([intro] if rng.random() < 0.6 else []) + rng.sample(
+            pool_m, k=min(len(pool_m), k_more))
         taken = {r.id for r in reporters}
         on_chain = [r for r in chains_later_than(intro) if r.id not in taken]
+        if not linked_m:
+            on_chain = [r for r in on_chain if intro.id not in nbrs[r.id]] or on_chain
         chain_rep = rng.choice(on_chain) if on_chain and rng.random() < CHAIN_REPORT_P else None
         if chain_rep is not None:
             reporters.append(chain_rep)
             stats["chain_reporters"] += 1
+        if linked_m:
+            for r in uniq(users + reporters):
+                if r is not intro and intro.id not in r.parent_ids + r.citation_ids:
+                    r.citation_ids.append(intro.id)
+                    stats["citations_added"] += 1
         for j, r in enumerate(uniq(reporters)):
             d = ds[j % len(ds)]
             x = metric_of[d]
@@ -710,11 +736,30 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
         cue = _MH_CUE[family].format(mkind=_KIND_WORD[kind[m]], kind=_KIND_WORD[kind[d]] if d else "")
         return " ".join(_paraphrase(pick, rng)) + " " + cue
 
-    def linked(a: Card, gold: Card) -> bool:
-        return gold.id in (a.parent_ids + a.citation_ids) and gold.committed_at <= a.committed_at
-
     def alias_used(gold: Card, m: str) -> bool:
         return any(e == m and s != ename[m] for e, s, _r in gold.true_mentions)
+
+    # The DAG method's reach, MEASURED on the record rather than read from the planting:
+    # undirected parent/citation edges (one hop each) and supersession links (no hop: a
+    # version is the same paper), both ends existing at t. The SQL walk counts the same way.
+    adj: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for c in cards:
+        for d in c.parent_ids + c.citation_ids:
+            if d in by_id and by_id[d].committed_at <= c.committed_at:
+                adj[c.id].append((d, 1)); adj[d].append((c.id, 1))
+        if c.supersedes_id:
+            adj[c.id].append((c.supersedes_id, 0)); adj[c.supersedes_id].append((c.id, 0))
+
+    def dag_reach(a: Card, t: datetime) -> set[str]:
+        best, dq = {a.id: 0}, deque([a.id])
+        while dq:                                       # 0-1 BFS
+            u = dq.popleft()
+            for w, cost in adj[u]:
+                d = best[u] + cost
+                if d <= DAG_HOPS and by_id[w].committed_at <= t and d < best.get(w, DAG_HOPS + 1):
+                    best[w] = d
+                    dq.appendleft(w) if cost == 0 else dq.append(w)
+        return set(best)
 
     def methods_used(c: Card) -> set:
         return {e for e, _s, role in c.true_mentions if role == "uses" and top_class(kind[e]) == "Method"}
@@ -750,8 +795,10 @@ def build_multihop_queries(cards: list[Card], entities: list[tuple], target: int
             return None
         slices = [family, "hops3" if family == "bridge3" else
                   "hops2" if family in LAST_HOP_FAMILIES else "multi_doc"]
+        reach = dag_reach(a, t)
+        slices.append("dag_reachable" if all(any(c in reach for c in s) for s in slots[1:])
+                      else "entity_only")
         if gold is not None and family in LAST_HOP_FAMILIES:
-            slices.append("linked" if linked(a, gold) else "unlinked")
             if alias_used(gold, answer["_m"]):
                 slices.append("alias")
             if gold.proofline_id != a.proofline_id:
@@ -2312,25 +2359,25 @@ DAG_WALK_SQL = """
 WITH RECURSIVE walk(node, depth) AS (
     SELECT s, 0 FROM unnest(%(seeds)s::text[]) AS s
   UNION
-    SELECT n.nbr, w.depth + 1
+    SELECT n.nbr, w.depth + n.cost
     FROM walk w
     CROSS JOIN LATERAL (
-        SELECT e.dst AS nbr FROM edges e
+        SELECT e.dst AS nbr, 1 AS cost FROM edges e
          WHERE e.src = w.node AND e.kind IN ('parent', 'citation')
            AND (%(blind)s OR e.valid_from <= %(t)s)
         UNION ALL
-        SELECT e.src FROM edges e
+        SELECT e.src, 1 FROM edges e
          WHERE e.dst = w.node AND e.kind IN ('parent', 'citation')
            AND (%(blind)s OR e.valid_from <= %(t)s)
-        UNION ALL
-        SELECT c.supersedes_id FROM cards c
+        UNION ALL           -- a version is the same paper: moving along its chain is free
+        SELECT c.supersedes_id, 0 FROM cards c
          WHERE c.id = w.node AND c.supersedes_id IS NOT NULL
            AND (%(blind)s OR c.committed_at <= %(t)s)
         UNION ALL
-        SELECT c.id FROM cards c
+        SELECT c.id, 0 FROM cards c
          WHERE c.supersedes_id = w.node AND (%(blind)s OR c.committed_at <= %(t)s)
     ) AS n
-    WHERE w.depth < %(hops)s
+    WHERE w.depth + n.cost <= %(hops)s
 )
 SELECT node, min(depth) AS depth FROM walk GROUP BY node
 """
@@ -2349,8 +2396,9 @@ SELECT id, supersedes_id FROM cards
 def dag_neighbourhood(conn, seeds: Sequence[str], as_of: datetime, hops: int = DAG_HOPS,
                       time_blind: bool = False) -> tuple[dict[str, int], list[tuple[str, str]]]:
     """The DAG method's traversal, in SQL: every card within `hops` undirected steps of
-    the seeds along the parent/citation edges and supersession links that existed at
-    as_of, with its depth, then the links among those cards. time_blind drops every
+    the seeds along the parent/citation edges that existed at as_of, with its depth,
+    then the links among those cards. Moving along a version chain (a supersession link
+    that existed at as_of) costs no step: a version is the same paper. time_blind drops every
     date: the ablation that shows what links made after the question would buy."""
     args = dict(seeds=list(seeds), t=as_of, blind=time_blind, hops=hops)
     with conn.cursor() as cur:
@@ -4196,7 +4244,7 @@ B5_METHODS = ("two_step", "dag_walk", "onto_walk", "onto_llm_walk")
 B5_PAIRS = [(B5_REFERENCE, m) for m in B5_METHODS] + [
     ("dag_walk", "onto_walk"), ("two_step", "onto_walk"), ("two_step", "dag_walk"),
     ("onto_walk", "onto_llm_walk")]
-B5_SLICES = ("linked", "unlinked", "hops2", "hops3", "multi_doc", "alias", "cross_project")
+B5_SLICES = ("dag_reachable", "entity_only", "hops2", "hops3", "multi_doc", "alias", "cross_project")
 
 
 def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Tracer) -> dict:
