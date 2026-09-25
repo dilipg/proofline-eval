@@ -2399,12 +2399,21 @@ class DagWalk(Scorer):
         return self._emit_hops(fs, second, k, walk_order=walk_order)
 
 
+class DagWalkBlind(DagWalk):
+    """Ablation, not a method: dag_walk with every edge and version date ignored, so
+    links made after the question may carry mass. Results are still as of the question."""
+    name = "dag_walk_blind"
+    time_blind = True
+    description = "ablation: dag_walk ignoring every date on edges and versions (results still as-of)."
+
+
 class OntoWalk(Scorer):
     """The ontology method: Personalized PageRank from the first stage's top 10 over
     cards + extracted entities, masked at as_of. Reaches a card that shares an entity
     with the question's subject and nothing else."""
     name = "onto_walk"
     uses_ontology = True
+    time_blind = False
     description = "PPR over the as-of-masked card-entity graph from the extraction."
 
     def run(self, q, k):
@@ -2414,8 +2423,18 @@ class OntoWalk(Scorer):
         ok = pool(self.idx, q)
         fs = first_stage(self.idx, self.embedder, q)
         seed = {i: fs[i] for i in ranked_ids(fs)[:10]}
-        p = self.idx.onto.ppr(seed, q.as_of, q.intent, self.idx.snapshot_mask(q.as_of))
+        p = self.idx.onto.ppr(seed, q.as_of, q.intent, self.idx.snapshot_mask(q.as_of),
+                              time_blind=self.time_blind)
         return self._emit_hops(fs, {int(i): float(p[i]) for i in np.nonzero(p > 0)[0] if ok[i]}, k)
+
+
+class OntoWalkBlind(OntoWalk):
+    """Ablation, not a method: onto_walk with every validity window ignored, so facts
+    and cards from after the question may carry mass. Results are still as of the
+    question. onto_walk minus this is what the ontology's time model is worth."""
+    name = "onto_walk_blind"
+    time_blind = True
+    description = "ablation: onto_walk ignoring every date in the ontology (results still as-of)."
 
 
 class LLMCache:
@@ -2576,7 +2595,8 @@ class OntoLlmWalk(Scorer):
 SCORERS: dict[str, type[Scorer]] = {c.name: c for c in
                                     [BM25Scorer, DenseScorer, HybridRRF,
                                      HybridFresh, GraphBoost, CrossEncoderRerank,
-                                     TwoStep, DagWalk, OntoWalk, OntoLlmWalk]}
+                                     TwoStep, DagWalk, OntoWalk, OntoLlmWalk,
+                                     DagWalkBlind, OntoWalkBlind]}
 
 # label sources that are derived from the record's link structure
 GRAPH_DERIVED_LABELS = {"dag_mined"}
