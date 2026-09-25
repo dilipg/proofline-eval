@@ -4241,9 +4241,11 @@ def branch4_loop(store: Store, cfg: Config, embedder: Embedder,
 
 B5_REFERENCE = "hybrid_rrf_fresh"
 B5_METHODS = ("two_step", "dag_walk", "onto_walk", "onto_llm_walk")
+B5_ABLATIONS = ("dag_walk_blind", "onto_walk_blind")
 B5_PAIRS = [(B5_REFERENCE, m) for m in B5_METHODS] + [
     ("dag_walk", "onto_walk"), ("two_step", "onto_walk"), ("two_step", "dag_walk"),
-    ("onto_walk", "onto_llm_walk")]
+    ("onto_walk", "onto_llm_walk"),
+    ("dag_walk", "dag_walk_blind"), ("onto_walk", "onto_walk_blind")]
 B5_SLICES = ("dag_reachable", "entity_only", "hops2", "hops3", "multi_doc", "alias", "cross_project")
 
 
@@ -4278,10 +4280,10 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
     dev = [q for q in qs if meta[q.source_card]["proofline_id"] not in held]
     tst = [q for q in qs if meta[q.source_card]["proofline_id"] in held]
 
-    names = [B5_REFERENCE] + (["rerank"] if cfg.b5_rerank else []) + list(B5_METHODS)
+    names = [B5_REFERENCE] + (["rerank"] if cfg.b5_rerank else []) + list(B5_METHODS) + list(B5_ABLATIONS)
     skipped = {}
     if not extraction_available(store, cfg.extractor):
-        for nm in ("onto_walk", "onto_llm_walk"):
+        for nm in ("onto_walk", "onto_llm_walk", "onto_walk_blind"):
             skipped[nm] = (f"NOT INGESTED: no extraction '{cfg.extractor}'; run ingest_semantica.py "
                            f"or pass --extractor")
             log(f"  {nm}: {skipped[nm]}")
@@ -4306,9 +4308,9 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
     idx = build_index(store, None, None, cfg.extractor if "onto_walk" in names else None)
     fs_tops = sorted(max(first_stage(idx, embedder, q).values(), default=0.0) for q in dev)
     shared_thr = float(np.quantile(fs_tops, cfg.abstain_fabr)) if fs_tops else float("-inf")
-    thr = {n: shared_thr for n in names if n in B5_METHODS}
+    thr = {n: shared_thr for n in names if n in B5_METHODS or n in B5_ABLATIONS}
     for n in names:
-        if n not in B5_METHODS:
+        if n not in B5_METHODS and n not in B5_ABLATIONS:
             thr[n] = calibrate_abstain(store, SCORERS[n](), embedder, dev, cfg, tracer)
 
     runs: dict[str, RunResult] = {}
@@ -4403,7 +4405,7 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
         labels = [("overall", [q.id for q in qs]), ("  dev split", [q.id for q in dev]),
                   ("  held-out prooflines", [q.id for q in tst])]
         labels += [(f"  {f}", [q.id for q in qs if q.family == f]) for f in MH_FAMILIES]
-        if (a, b) in (("dag_walk", "onto_walk"), (B5_REFERENCE, "onto_walk")):
+        if b in ("onto_walk", "dag_walk_blind", "onto_walk_blind"):
             labels += [(f"  {s}", [q.id for q in qs if s in q.slices]) for s in B5_SLICES]
         rows = []
         for label, ids in labels:
@@ -4419,10 +4421,57 @@ def branch5_multihop(store: Store, cfg: Config, embedder: Embedder, tracer: Trac
             ci = f"[{r['lo']:+.3f},{r['hi']:+.3f}]" if not math.isnan(r["lo"]) else "        n/a"
             log(f"    {r['label']:<26}{r['n']:>5} {fmt(r['mean']):>8} {ci:>19}  {r['verdict']}")
 
+    mix = statistics.fmean(["dag_reachable" in q.slices for q in qs]) if qs else float("nan")
+
+    def pair_row(label: str, a: str, b: str) -> dict:
+        chrono = {p: m for p, m in groups.items() if any(x.family == "chrono_asof" for x in m)}
+        def outcome(r, members):
+            return float(all(r.per_query.get(m.id, {}).get("chain_recall") == 1.0 for m in members))
+        common = [p for p, m in chrono.items() if all(x.id in runs[a].ranked and x.id in runs[b].ranked for x in m)]
+        d = [outcome(runs[b], chrono[p]) - outcome(runs[a], chrono[p]) for p in common]
+        mean, lo, hi = bootstrap_ci(d, cfg.bootstrap)
+        return dict(label=label, n=len(d), mean=mean, lo=lo, hi=hi, verdict=verdict_of(mean, lo, hi))
+
+    def recall_row(label: str, a: str, b: str, ids: list[str]) -> dict:
+        d, _keep = paired(runs[a], runs[b], "chain_recall", ids)
+        mean, lo, hi = bootstrap_ci(d, cfg.bootstrap)
+        return dict(label=label, n=len(d), mean=mean, lo=lo, hi=hi, verdict=verdict_of(mean, lo, hi))
+
+    verdict, ablation = [], []
+    if "dag_walk" in runs and "onto_walk" in runs:
+        a, b = "dag_walk", "onto_walk"
+        verdict = [recall_row("all questions", a, b, [q.id for q in qs]),
+                   recall_row("DAG-reachable", a, b, [q.id for q in qs if "dag_reachable" in q.slices]),
+                   recall_row("entity-only", a, b, [q.id for q in qs if "entity_only" in q.slices]),
+                   pair_row("as-of pairs, both sides right", a, b),
+                   recall_row("history (versions before a revision)", a, b,
+                              [q.id for q in qs if q.family == "history"])]
+        log(f"\n  VERDICT  ontology (B) vs DAG + SQL (A), Δ = B - A; "
+            f"this corpus is {mix:.0%} DAG-reachable")
+        for r in verdict:
+            ci = f"[{r['lo']:+.3f},{r['hi']:+.3f}]" if not math.isnan(r["lo"]) else "        n/a"
+            log(f"    {r['label']:<38}{r['n']:>5} {fmt(r['mean']):>8} {ci:>19}  {r['verdict']}")
+    else:
+        log(f"\n  VERDICT  not measured: it needs both dag_walk and onto_walk "
+            f"({skipped.get('onto_walk') or skipped.get('dag_walk') or 'one did not run'})")
+    for m, blind in (("dag_walk", "dag_walk_blind"), ("onto_walk", "onto_walk_blind")):
+        if m in runs and blind in runs:
+            for label, ids in (("all questions", [q.id for q in qs]),
+                               ("chrono_asof", [q.id for q in qs if q.family == "chrono_asof"]),
+                               ("history", [q.id for q in qs if q.family == "history"])):
+                row = recall_row(label, m, blind, ids)
+                ablation.append(dict(row, method=m))
+    if ablation:
+        log("\n  ABLATION  what ignoring dates would buy each method (Δ = blind - aware; "
+            "positive means the future helps, so the as-of walk is refusing it)")
+        for r in ablation:
+            ci = f"[{r['lo']:+.3f},{r['hi']:+.3f}]" if not math.isnan(r["lo"]) else "        n/a"
+            log(f"    {r['method']:<11}{r['label']:<27}{r['n']:>5} {fmt(r['mean']):>8} {ci:>19}  {r['verdict']}")
+
     return dict(queries=counts, dropped=dropped, skipped=skipped, thresholds=thr,
                 scorers=summary, oracle=oracle_out, comparisons=comparisons,
                 walker_sample=dict(Counter(q.family for q in walker_pick)) if walker else {},
-                extraction=extraction, twin_note=twin_note,
+                extraction=extraction, twin_note=twin_note, mix=mix, verdict=verdict, ablation=ablation,
                 walker_errors=getattr(walker, "errors", 0) if walker else 0)
 
 # ----------------------------------------------------------------------------------

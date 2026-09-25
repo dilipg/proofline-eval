@@ -216,13 +216,27 @@ single hop can answer (MuSiQue's disconnection filter), with its pair.
     uv run proofline_eval.py b5 --extractor semantica:llm:anthropic:claude-haiku-4-5 \
         --walker anthropic:claude-haiku-4-5 --llm-queries 40
 
-B5 compares `dag_walk` (citation edges), `onto_walk` (Personalized PageRank over the
-extracted ontology) and `onto_llm_walk` (an LLM chooses each hop) against the
-query-side control `two_step` and the reference `hybrid_rrf_fresh`, paired on
-chain_recall: a question counts only when every hop's evidence is in the top k. A
-gold-chain oracle row must read 1.000; anything less is a harness bug. Slices split
-the questions by `hops2` / `hops3` (a last-hop answer two or three cards away) against
-`multi_doc` (timelines, histories, aggregates: several cards, one hop each).
+B5 asks which ingestion retrieves multi-hop evidence better: the DAG in Postgres or
+the extracted ontology. `dag_walk` is DAG + SQL: a recursive CTE in Postgres walks up to
+3 undirected hops along the parent/citation edges that existed at the question's date
+(moving along a version chain is free: a version is the same paper), and the same
+personalized PageRank the ontology walk uses ranks what it reached, so only the graph
+differs. `onto_walk` walks the extracted ontology; `onto_llm_walk` lets an LLM choose
+each hop; `two_step` is the query-side control and `hybrid_rrf_fresh` the reference.
+Everything is paired on chain_recall: a question counts only when every hop's evidence
+is in the top k. A gold-chain oracle row must read 1.000; anything less is a harness bug.
+
+Every question is stratified by whether its evidence is reachable along the DAG within
+those hops, measured on the record (`dag_reachable` / `entity_only`). The planting puts
+about half the methods inside the DAG (their users and reporters cite the card that
+introduced them), and B5 prints a VERDICT block per stratum with the corpus's mix, so
+the generator does not choose the winner. Chronology is scored on what a method can
+fail: both sides of an as-of pair right, the versions before a revision (`history`),
+and chains in each method's own order (the harness never sorts them by date).
+`dag_walk_blind` and `onto_walk_blind` are ablations that ignore every date while
+walking (results stay as of the question): the ABLATION block shows what each
+ingestion's time model is refusing. Other slices split `hops2` / `hops3` (a last-hop
+answer two or three cards away) from `multi_doc` (timelines, histories, aggregates).
 
 Expect every scorer to fail `answered_a_no_answer_query` on the twins. A ranker always
 returns k cards, so it has no second-hop signal to abstain on; B5 prints a line saying

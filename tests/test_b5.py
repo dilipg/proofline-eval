@@ -34,7 +34,7 @@ def test_b5_without_extraction_skips_ontology_scorers(ingested):
     cfg = pe.Config(profile="smoke", extractor="none:missing")
     out = pe.branch5_multihop(store, cfg, emb, _NoTrace())
     assert out["oracle"]["chain_recall"] == 1.0 and out["oracle"]["order_tau"] == 1.0
-    assert set(out["skipped"]) == {"onto_walk", "onto_llm_walk"}
+    assert set(out["skipped"]) == {"onto_walk", "onto_llm_walk", "onto_walk_blind"}
     assert {"hybrid_rrf_fresh", "two_step", "dag_walk"} <= set(out["scorers"])
     assert out["comparisons"]
 
@@ -132,3 +132,54 @@ def test_b5_explains_why_every_scorer_answers_the_twins(ingested, capsys):
     out = pe.branch5_multihop(store, pe.Config(profile="smoke", extractor="none:missing"), emb, _NoTrace())
     if any(s["hard_checks"]["answered_a_no_answer_query"]["fails"] for s in out["scorers"].values()):
         assert "second-hop signal" in capsys.readouterr().out
+
+
+@pytest.fixture
+def truth_extraction(ingested, smoke_corpus):
+    """The planted entity layer written into the EXTRACTED tables under its own source:
+    a perfect extractor, so the ontology rows of B5 run without Semantica."""
+    import ingest_semantica as ing
+    store, _emb = ingested
+    rows = [dict(id=c.id, committed_at=c.committed_at, supersedes_id=c.supersedes_id)
+            for c in smoke_corpus.cards]
+    w = ing.validity_windows(rows)
+    ments = [(c.id, e, s, r) for c in smoke_corpus.cards for e, s, r in c.true_mentions]
+    facts = [(c.id, s, r, o, v, *w[c.id]) for c in smoke_corpus.cards for s, r, o, v in c.true_facts]
+    ents = [(e, n, k) for e, n, k, _p in smoke_corpus.entities]
+    ing.write_back(store, "test:truth-facts", [c.id for c in smoke_corpus.cards], ents, ments, facts, [])
+    yield "test:truth-facts"
+    with store.conn.cursor() as cur:
+        for t in ("entities", "mentions", "facts", "onto_classes", "extracted_cards"):
+            cur.execute(f"DELETE FROM {t} WHERE source = 'test:truth-facts'")
+    pe._INDEX_CACHE.clear()
+
+
+def test_b5_reports_the_verdict_per_stratum(ingested, truth_extraction):
+    store, emb = ingested
+    out = pe.branch5_multihop(store, pe.Config(profile="smoke", extractor=truth_extraction), emb, _NoTrace())
+    assert 0.0 < out["mix"] < 1.0
+    assert [r["label"] for r in out["verdict"]] == [
+        "all questions", "DAG-reachable", "entity-only", "as-of pairs, both sides right",
+        "history (versions before a revision)"]
+    assert {r["method"] for r in out["ablation"]} == {"dag_walk", "onto_walk"}
+    for n in ("dag_walk_blind", "onto_walk_blind"):
+        assert out["scorers"][n]["hard_checks"]["result_outside_snapshot"]["fails"] == 0
+
+
+def test_b5_without_an_extraction_has_no_verdict_rows(ingested):
+    store, emb = ingested
+    out = pe.branch5_multihop(store, pe.Config(profile="smoke", extractor="none:missing"), emb, _NoTrace())
+    assert out["verdict"] == [] and "onto_walk_blind" in out["skipped"]
+
+
+def test_b5_runs_the_dag_ablation_and_it_stays_as_of(ingested):
+    store, emb = ingested
+    out = pe.branch5_multihop(store, pe.Config(profile="smoke", extractor="none:missing"), emb, _NoTrace())
+    assert "dag_walk_blind" in out["scorers"]
+    assert out["scorers"]["dag_walk_blind"]["hard_checks"]["result_outside_snapshot"]["fails"] == 0
+    assert any(r["method"] == "dag_walk" for r in out["ablation"])
+
+
+def test_b5_slices_are_the_strata():
+    assert pe.B5_SLICES[:2] == ("dag_reachable", "entity_only")
+    assert ("dag_walk", "dag_walk_blind") in pe.B5_PAIRS and ("onto_walk", "onto_walk_blind") in pe.B5_PAIRS

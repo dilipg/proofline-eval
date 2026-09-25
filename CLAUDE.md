@@ -108,7 +108,8 @@ Breaking one of these silently invalidates every number downstream.
    `idx.snapshot_mask(q.as_of)` inside the scorer. A scorer that skips the mask will
    score well and be wrong. Never rebuild the index per timestamp (that was the 2-minute
    bug; see HARNESS-NOTES). "Current" means current at `q.as_of` (`idx.current_at`);
-   `current_mask` is the end of the record and is never used to filter.
+   `current_mask` is the end of the record and is never used to filter. Chains are
+   never sorted by date in the harness: a scorer's chain is its own order.
 5. **Scale points pin the needles.** `build_index(store, n_limit, keep)` passes `keep` =
    every judged card into `Store.subset()`, so growing the corpus adds distractors
    instead of deleting answers.
@@ -172,7 +173,8 @@ RESULTS.html          findings from the full four-branch run on 60k arXiv cards
 - **New multi-hop scorer**: start from `first_stage(idx, embedder, q)` (as-of and intent
   aware via `pool()`), and emit through `Scorer._emit_hops(first_stage, second_hop, k)`.
   Fusing the second hop into one ranked list lets the ten seeds fill the top ten; measured,
-  that zeroed chain_recall for every method.
+  that zeroed chain_recall for every method. `dag_walk` reads Postgres through
+  `self.store` (set by `execute_run`); its unit tests use the `dag_db` fixture.
 - **New CLI flag**: `argparse` in `main()` *and* the `Config` field *and* the `Config(...)`
   construction, three places, all in one screen. Current additions beyond the original
   set: `--source`, `--eval-provenance`, `--max-eval-queries`, `--scale-judged-budget`,
