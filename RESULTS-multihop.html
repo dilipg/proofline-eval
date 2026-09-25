@@ -1,0 +1,435 @@
+<title>Multi-hop Retrieval: DAG vs Ontology</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,600;1,6..72,400&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --ground:#F7F8FA; --raise:#FFFFFF; --ink:#14181F; --muted:#5C6672;
+  --rule:#DCE1E8; --rule-soft:#E9EDF2;
+  --accent:#1B6E6A; --accent-soft:#E4EFEE;
+  --pass:#2E7D5B; --fail:#B4462E; --warn:#8A6410;
+  --pass-bg:#E6F1EB; --fail-bg:#F8E7E2; --warn-bg:#F6EEDD;
+  --shadow:0 1px 2px rgba(20,24,31,.05);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0F1216; --raise:#161B21; --ink:#E7ECF2; --muted:#98A3B0;
+    --rule:#272E37; --rule-soft:#1E242B;
+    --accent:#5FB8B2; --accent-soft:#152826;
+    --pass:#6BC79A; --fail:#E2896F; --warn:#D2A54C;
+    --pass-bg:#14241C; --fail-bg:#2A1913; --warn-bg:#251E10;
+    --shadow:0 1px 2px rgba(0,0,0,.4);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0F1216; --raise:#161B21; --ink:#E7ECF2; --muted:#98A3B0;
+  --rule:#272E37; --rule-soft:#1E242B;
+  --accent:#5FB8B2; --accent-soft:#152826;
+  --pass:#6BC79A; --fail:#E2896F; --warn:#D2A54C;
+  --pass-bg:#14241C; --fail-bg:#2A1913; --warn-bg:#251E10;
+  --shadow:0 1px 2px rgba(0,0,0,.4);
+}
+*{box-sizing:border-box}
+body{
+  background:var(--ground); color:var(--ink);
+  font-family:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font-size:16px; line-height:1.62; margin:0;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px; margin:0 auto; padding:56px 28px 96px;
+  display:flex; flex-direction:column; gap:0}
+.col{max-width:68ch}
+h1,h2,h3{font-family:Newsreader,Georgia,serif; text-wrap:balance; margin:0}
+h1{font-size:clamp(2.1rem,5vw,3.1rem); font-weight:600; line-height:1.1; letter-spacing:-.015em}
+h2{font-size:1.75rem; font-weight:600; line-height:1.2; margin-bottom:.2em}
+h3{font-size:1.12rem; font-weight:600; margin:2em 0 .5em}
+p{margin:0 0 1.05em}
+a{color:var(--accent)}
+.eyebrow{font-family:"IBM Plex Mono",monospace; font-size:.7rem; font-weight:500;
+  letter-spacing:.16em; text-transform:uppercase; color:var(--muted)}
+.lede{font-size:1.16rem; color:var(--muted); max-width:64ch; margin-top:1.1em}
+hr{border:0; border-top:1px solid var(--rule); margin:0}
+
+/* branch heading */
+.branch{display:flex; align-items:baseline; gap:16px; margin:0 0 .35em}
+.branch .tag{font-family:"IBM Plex Mono",monospace; font-size:.78rem; font-weight:600;
+  color:var(--accent); border:1px solid var(--accent); border-radius:3px;
+  padding:2px 8px; flex:none; letter-spacing:.06em}
+section{padding:44px 0; border-top:1px solid var(--rule)}
+section:first-of-type{border-top:0}
+
+/* verdict stamp */
+.stamp{font-family:"IBM Plex Mono",monospace; font-size:.82rem; font-weight:600;
+  letter-spacing:.04em; padding:10px 14px; border-left:3px solid var(--accent);
+  background:var(--accent-soft); color:var(--ink); margin:0 0 1.5em; max-width:68ch}
+
+/* tables */
+.tw{overflow-x:auto; margin:1.4em 0; border:1px solid var(--rule);
+  border-radius:4px; background:var(--raise); box-shadow:var(--shadow)}
+table{border-collapse:collapse; width:100%; font-size:.875rem}
+th,td{padding:9px 14px; text-align:left; border-bottom:1px solid var(--rule-soft);
+  white-space:nowrap}
+thead th{font-family:"IBM Plex Mono",monospace; font-size:.68rem; font-weight:600;
+  letter-spacing:.1em; text-transform:uppercase; color:var(--muted);
+  border-bottom:1px solid var(--rule); background:var(--ground)}
+tbody tr:last-child td{border-bottom:0}
+td.n,th.n{text-align:right; font-family:"IBM Plex Mono",monospace;
+  font-variant-numeric:tabular-nums}
+td.name{font-family:"IBM Plex Mono",monospace; font-size:.82rem}
+tr.hi td{background:var(--accent-soft)}
+.tw.cells td{white-space:normal; min-width:9em}
+caption{caption-side:bottom; text-align:left; padding:10px 14px; font-size:.8rem;
+  color:var(--muted); border-top:1px solid var(--rule-soft)}
+
+.pill{font-family:"IBM Plex Mono",monospace; font-size:.7rem; font-weight:600;
+  padding:2px 7px; border-radius:3px; letter-spacing:.04em; white-space:nowrap}
+.p-pass{background:var(--pass-bg); color:var(--pass)}
+.p-fail{background:var(--fail-bg); color:var(--fail)}
+.p-warn{background:var(--warn-bg); color:var(--warn)}
+
+/* corpus strip */
+.facts{display:grid; grid-template-columns:repeat(auto-fit,minmax(148px,1fr));
+  gap:0; border:1px solid var(--rule); border-radius:4px; overflow:hidden;
+  background:var(--raise); margin:1.6em 0}
+.fact{padding:14px 16px; border-right:1px solid var(--rule-soft)}
+.fact:last-child{border-right:0}
+.fact dt{font-family:"IBM Plex Mono",monospace; font-size:.64rem; letter-spacing:.1em;
+  text-transform:uppercase; color:var(--muted); margin-bottom:3px}
+.fact dd{margin:0; font-family:"IBM Plex Mono",monospace; font-size:1.05rem;
+  font-weight:500; font-variant-numeric:tabular-nums}
+
+figure{margin:1.8em 0}
+figcaption{font-size:.82rem; color:var(--muted); margin-top:.7em; max-width:64ch}
+svg{display:block; max-width:100%; height:auto}
+
+ul,ol{margin:0 0 1.05em; padding-left:1.15em; max-width:68ch}
+li{margin-bottom:.5em}
+code{font-family:"IBM Plex Mono",monospace; font-size:.86em;
+  background:var(--rule-soft); padding:1px 5px; border-radius:3px}
+strong{font-weight:600}
+.foot{color:var(--muted); font-size:.86rem; max-width:68ch}
+.note{border-left:2px solid var(--rule); padding-left:16px; color:var(--muted);
+  max-width:66ch; margin:1.4em 0}
+</style>
+
+<div class="wrap">
+
+<header class="col" style="padding-bottom:8px">
+  <div class="eyebrow">Retrieval evaluation &middot; 25 September 2026</div>
+  <h1>Multi-hop Retrieval: DAG vs Ontology</h1>
+  <p class="lede">Which way of ingesting a research record finds evidence spread across
+  several documents, and answers as of the right date: the citation DAG in Postgres,
+  walked with SQL, or an ontology extracted with Semantica? On 1,730 planted multi-hop
+  questions the ontology wins, and the reason is how it connects documents, not the
+  database it lives in.</p>
+</header>
+
+<section>
+  <h2>The answer</h2>
+  <div class="stamp">The ontology beats DAG + SQL on every stratum and on both tests of
+  time. With realistic Haiku extraction the margin is <strong>+0.028</strong>
+  chain_recall@10; with perfect extraction it is <strong>+0.160</strong>.</div>
+
+  <dl class="facts">
+    <div class="fact"><dt>Cards</dt><dd>2,497</dd></div>
+    <div class="fact"><dt>Questions</dt><dd>1,730</dd></div>
+    <div class="fact"><dt>Question families</dt><dd>7</dd></div>
+    <div class="fact"><dt>DAG-reachable</dt><dd>57%</dd></div>
+    <div class="fact"><dt>Hop budget</dt><dd>3</dd></div>
+    <div class="fact"><dt>Top k</dt><dd>10</dd></div>
+  </dl>
+
+  <p class="col">A question counts only when <em>every</em> hop's evidence is in the top
+  10 (chain_recall@10). Every comparison is paired on the same questions with a 2,000-sample
+  bootstrap, and a gold-chain oracle row reads 1.000 in both runs, so the scoring itself
+  is sound.</p>
+</section>
+
+<section>
+  <h2>What was measured</h2>
+  <p class="col">The synthetic corpus plants a typed entity layer (methods, datasets,
+  metrics) into card text, then composes questions MuSiQue-style: the question speaks
+  in one card's words and never names the entity that bridges to the answer. Seven
+  families: <code>bridge</code> and <code>bridge3</code> (the answer is two or three
+  cards away), <code>chrono_asof</code> (the same question either side of a change),
+  <code>timeline</code>, <code>history</code> (every version before a revision),
+  <code>aggregate_set</code> and <code>aggregate_count</code>. Any question a single
+  hop can answer is dropped, with its pair.</p>
+
+  <div class="tw cells"><table>
+    <caption>Both walks start from the same ten first-stage seeds, rank with the same personalized PageRank (alpha 0.5, 20 iterations) and spend the same top 10. Only the graph differs.</caption>
+    <thead><tr><th>Method</th><th>Ingestion</th><th>How it walks</th></tr></thead>
+    <tbody>
+      <tr class="hi"><td class="name">onto_walk</td><td>Semantica extraction: cards + entities + facts with validity windows</td>
+        <td>PageRank over the card&ndash;entity graph as of the question</td></tr>
+      <tr><td class="name">dag_walk</td><td>Cards + parent/citation edges + version chains, in Postgres</td>
+        <td>A recursive SQL query, up to 3 hops as of the question, then PageRank over what it reached</td></tr>
+      <tr><td class="name">two_step</td><td>none (query-side control)</td>
+        <td>Retrieve, add the top cards' rarest words, retrieve again</td></tr>
+      <tr><td class="name">hybrid_rrf_fresh</td><td>none (reference)</td>
+        <td>BM25 + dense, fused, current versions only</td></tr>
+    </tbody>
+  </table></div>
+
+  <p class="col">Two extractions feed the ontology. <strong>Haiku</strong>
+  (<code>claude-haiku-4-5</code>) is the realistic one. <strong>Regex</strong> reads the
+  corpus's own templates back perfectly, so it is an upper bound on what an ontology can
+  do here, not a realistic ingestion.</p>
+
+  <p class="col">The first version of this benchmark could not answer the question: 97%
+  of its evidence chains had no DAG path at all, so the generator chose the winner. Half
+  the methods are now planted inside the DAG (the cards that use and report a method cite
+  the card that introduced it, as real papers do), and every question is stratified by
+  its <em>measured</em> DAG distance: <strong>DAG-reachable</strong> when all its evidence
+  is within 3 hops along citations that existed at its date, <strong>entity-only</strong>
+  otherwise.</p>
+</section>
+
+<section>
+  <h2>The verdict holds in both strata</h2>
+  <div class="stamp">Where the DAG has a path to the evidence, the ontology still wins
+  by the same margin as where it has none. The mix of question types changes nothing.</div>
+
+  <div class="tw"><table>
+    <caption>Paired difference in chain_recall@10, ontology minus DAG + SQL, 95% bootstrap interval.</caption>
+    <thead><tr><th>Questions</th><th class="n">n</th><th class="n">Haiku ontology &minus; DAG</th>
+      <th class="n">Regex ontology &minus; DAG</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr class="hi"><td class="name">all</td><td class="n">1,730</td><td class="n">+0.028 [+0.018, +0.039]</td>
+        <td class="n">+0.160 [+0.142, +0.176]</td><td><span class="pill p-pass">ONTOLOGY</span></td></tr>
+      <tr><td class="name">DAG-reachable</td><td class="n">979</td><td class="n">+0.027 [+0.010, +0.042]</td>
+        <td class="n">+0.164 [+0.140, +0.191]</td><td><span class="pill p-pass">ONTOLOGY</span></td></tr>
+      <tr><td class="name">entity-only</td><td class="n">751</td><td class="n">+0.031 [+0.019, +0.044]</td>
+        <td class="n">+0.153 [+0.129, +0.178]</td><td><span class="pill p-pass">ONTOLOGY</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="tw"><table>
+    <caption>Absolute scores. Haiku run for the ontology row marked Haiku; the others are identical in both runs.</caption>
+    <thead><tr><th>Scorer</th><th class="n">chain_recall@10</th><th class="n">slot_recall@10</th></tr></thead>
+    <tbody>
+      <tr><td class="name">hybrid_rrf_fresh (first stage alone)</td><td class="n">0.001</td><td class="n">0.263</td></tr>
+      <tr><td class="name">two_step</td><td class="n">0.002</td><td class="n">0.218</td></tr>
+      <tr><td class="name">dag_walk (DAG + SQL)</td><td class="n">0.013</td><td class="n">0.231</td></tr>
+      <tr class="hi"><td class="name">onto_walk, Haiku</td><td class="n">0.042</td><td class="n">0.263</td></tr>
+      <tr class="hi"><td class="name">onto_walk, regex</td><td class="n">0.173</td><td class="n">0.377</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Why the ontology wins</h2>
+  <div class="stamp">The DAG reaches the evidence; it cannot rank it. A shared named
+  entity is a one-step bridge between two documents; a shared citation is a two-step
+  bridge through a hub, and everything one step away outranks it.</div>
+
+  <figure>
+  <svg viewBox="0 0 720 290" role="img" aria-label="How the question card and the answer card are connected in each graph">
+    <g font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)" letter-spacing="1.5">
+      <text x="20" y="22">DAG + SQL</text>
+      <text x="380" y="22">ONTOLOGY</text>
+    </g>
+    <line x1="360" y1="12" x2="360" y2="278" stroke="var(--rule)" stroke-width="1"/>
+
+    <g stroke="var(--rule)" stroke-width="1.5">
+      <line x1="80" y1="160" x2="200" y2="70"/>
+      <line x1="300" y1="160" x2="200" y2="70"/>
+      <line x1="80" y1="160" x2="28" y2="118"/>
+      <line x1="80" y1="160" x2="24" y2="170"/>
+      <line x1="80" y1="160" x2="80" y2="100"/>
+      <line x1="200" y1="70" x2="150" y2="36"/>
+      <line x1="200" y1="70" x2="250" y2="36"/>
+    </g>
+    <g stroke="var(--ground)" stroke-width="2">
+      <circle cx="28" cy="118" r="7" fill="var(--muted)"/>
+      <circle cx="24" cy="170" r="7" fill="var(--muted)"/>
+      <circle cx="80" cy="100" r="7" fill="var(--muted)"/>
+      <circle cx="150" cy="36" r="6" fill="var(--muted)"/>
+      <circle cx="250" cy="36" r="6" fill="var(--muted)"/>
+      <circle cx="200" cy="70" r="11" fill="var(--warn)"/>
+      <circle cx="80" cy="160" r="12" fill="var(--accent)"/>
+      <circle cx="300" cy="160" r="12" fill="var(--pass)"/>
+    </g>
+    <g font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--ink)">
+      <text x="80" y="192" text-anchor="middle">question card</text>
+      <text x="300" y="192" text-anchor="middle">answer card</text>
+      <text x="216" y="74">introducer (a hub)</text>
+    </g>
+    <g font-family="IBM Plex Sans, sans-serif" font-size="12" fill="var(--muted)">
+      <text x="150" y="134">cites</text>
+      <text x="206" y="142">cites</text>
+    </g>
+    <text x="20" y="262" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">grey: what the seed cites itself, one hop away</text>
+
+    <g stroke="var(--rule)" stroke-width="1.5">
+      <line x1="440" y1="160" x2="540" y2="160"/>
+      <line x1="640" y1="160" x2="540" y2="160"/>
+      <line x1="440" y1="160" x2="430" y2="226"/>
+      <line x1="640" y1="160" x2="655" y2="226"/>
+    </g>
+    <g stroke="var(--ground)" stroke-width="2">
+      <rect x="516" y="146" width="48" height="28" rx="4" fill="var(--warn)"/>
+      <rect x="415" y="226" width="30" height="20" rx="3" fill="var(--muted)"/>
+      <rect x="640" y="226" width="30" height="20" rx="3" fill="var(--muted)"/>
+      <circle cx="440" cy="160" r="12" fill="var(--accent)"/>
+      <circle cx="640" cy="160" r="12" fill="var(--pass)"/>
+    </g>
+    <g font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--ink)">
+      <text x="440" y="134" text-anchor="middle">question card</text>
+      <text x="640" y="134" text-anchor="middle">answer card</text>
+      <text x="540" y="198" text-anchor="middle">the method both name</text>
+    </g>
+    <text x="380" y="262" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">grey: other entities each card names</text>
+  </svg>
+  <figcaption>Left: the question card and the card holding the answer both cite the paper that
+  introduced the method, so the answer is two hops away, behind every card the ten seeds cite
+  directly. Right: both cards name the method, so the answer is one entity away, and that entity
+  is specific to the method.</figcaption>
+  </figure>
+
+  <p class="col">The trace confirms it. On 40 DAG-reachable bridge questions the SQL walk
+  reached the answer card in <strong>38</strong>, then ranked it a median
+  <strong>79th</strong> of about 426 cards reached. Reach is not the DAG's problem; the
+  shape of its connection is. A citation says two papers are related. A shared entity
+  says <em>what</em> they share, which is what a multi-hop question asks for.</p>
+
+  <p class="col">Extraction quality is the other lever, and the larger one. The same walk
+  over a perfect ontology scores 0.173; over Haiku's, 0.042. Haiku extracted 1,204 entities
+  and 28,041 mentions where the planted layer has about 400 entities, and its mention
+  precision was 0.189 on 24 September: most of what it links is noise, and noise dilutes
+  the bridge. The ontology's advantage over the DAG is real at both qualities, but its size
+  is set by the extractor.</p>
+</section>
+
+<section>
+  <h2>By question family</h2>
+  <p class="col">The ontology is better or tied on every family and never worse. The
+  biggest gains are on the families that hinge on one entity: <code>bridge</code> and
+  <code>chrono_asof</code>.</p>
+  <div class="tw"><table>
+    <caption>Ontology minus DAG + SQL, chain_recall@10. UNDERPOWERED means the interval includes zero.</caption>
+    <thead><tr><th>Family</th><th class="n">n</th><th class="n">Haiku ontology &minus; DAG</th><th class="n">Regex ontology &minus; DAG</th></tr></thead>
+    <tbody>
+      <tr><td class="name">bridge</td><td class="n">276</td><td class="n">+0.040 [+0.000, +0.080] <span class="pill p-warn">UNDERPOWERED</span></td><td class="n">+0.261 [+0.207, +0.319]</td></tr>
+      <tr><td class="name">bridge3</td><td class="n">161</td><td class="n">+0.000 <span class="pill p-warn">UNDERPOWERED</span></td><td class="n">+0.012 [+0.000, +0.031] <span class="pill p-warn">UNDERPOWERED</span></td></tr>
+      <tr><td class="name">chrono_asof</td><td class="n">264</td><td class="n">+0.057 [+0.015, +0.098]</td><td class="n">+0.311 [+0.257, +0.367]</td></tr>
+      <tr><td class="name">timeline</td><td class="n">300</td><td class="n">+0.013 [+0.003, +0.030]</td><td class="n">+0.123 [+0.090, +0.163]</td></tr>
+      <tr><td class="name">history</td><td class="n">255</td><td class="n">+0.047 [+0.024, +0.075]</td><td class="n">+0.192 [+0.145, +0.243]</td></tr>
+      <tr><td class="name">aggregate_set</td><td class="n">174</td><td class="n">+0.011 [+0.000, +0.029] <span class="pill p-warn">UNDERPOWERED</span></td><td class="n">+0.029 [+0.006, +0.057]</td></tr>
+      <tr><td class="name">aggregate_count</td><td class="n">300</td><td class="n">+0.017 [+0.003, +0.033]</td><td class="n">+0.097 [+0.063, +0.133]</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Chronological adherence</h2>
+  <div class="stamp">Both methods are as-of correct by construction; the ontology is also
+  better at <em>using</em> time. Its fact validity windows are worth 0.034 on questions
+  whose answer changes at a date.</div>
+
+  <p class="col">Neither walk can return a card written after the question or a version
+  superseded by then: both answer through the same as-of mask, and the hard checks read
+  zero for both. What can differ is whether a method finds the right version on each side
+  of a change, and the full history of a revision.</p>
+
+  <div class="tw"><table>
+    <caption>Ontology minus DAG + SQL. As-of pairs are scored per pair: both questions of the pair must be answered right.</caption>
+    <thead><tr><th>Test</th><th class="n">n</th><th class="n">Haiku ontology &minus; DAG</th><th class="n">Regex ontology &minus; DAG</th></tr></thead>
+    <tbody>
+      <tr><td class="name">as-of pairs, both sides right</td><td class="n">132 pairs</td><td class="n">+0.030 [+0.008, +0.061]</td><td class="n">+0.288 [+0.212, +0.371]</td></tr>
+      <tr><td class="name">history, every earlier version</td><td class="n">255</td><td class="n">+0.047 [+0.024, +0.075]</td><td class="n">+0.192 [+0.145, +0.243]</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>What each method's time model is worth</h3>
+  <p class="col">Each walk was run again blind to dates: it may walk links and facts made
+  after the question, but still returns only cards that existed then. The change shows
+  what its own dating refuses.</p>
+  <div class="tw"><table>
+    <caption>Change in chain_recall@10, blind minus as-of. Negative: ignoring dates hurts, so the time model helps.</caption>
+    <thead><tr><th>Method</th><th class="n">All questions</th><th class="n">chrono_asof</th><th class="n">history</th></tr></thead>
+    <tbody>
+      <tr><td class="name">DAG + SQL</td><td class="n">&minus;0.001 <span class="pill p-warn">NONE</span></td><td class="n">&minus;0.011 <span class="pill p-warn">NONE</span></td><td class="n">0.000 <span class="pill p-warn">NONE</span></td></tr>
+      <tr class="hi"><td class="name">ontology, Haiku</td><td class="n">&minus;0.009 [&minus;0.015, &minus;0.003]</td><td class="n">&minus;0.034 [&minus;0.057, &minus;0.011]</td><td class="n">+0.012 <span class="pill p-warn">NONE</span></td></tr>
+      <tr><td class="name">ontology, regex</td><td class="n">&minus;0.001 <span class="pill p-warn">NONE</span></td><td class="n">&minus;0.030 [&minus;0.057, &minus;0.007]</td><td class="n">+0.031 [+0.012, +0.055]</td></tr>
+    </tbody>
+  </table></div>
+  <p class="col">The DAG's dates change nothing measurable, because a citation can only
+  point back in time: a date filter almost never removes a path. The ontology's facts
+  connect <em>entities</em>, so a fact recorded after the question can route the walk to the
+  wrong version, and its validity windows stop that.</p>
+
+  <p class="col">Chain order does not separate them. The DAG walk returns evidence in near
+  exact reverse time order (Kendall tau &minus;0.84), since citations point to the past;
+  the ontology walk's order is unrelated to time (tau 0.08). Either store can sort by
+  date, so order is metadata, not an ingestion property.</p>
+</section>
+
+<section>
+  <h2>Cost</h2>
+  <p class="col">DAG + SQL is the slowest walk at query time; the ontology pays at ingest.</p>
+  <div class="tw"><table>
+    <caption>Milliseconds per question on the quick corpus, embedded Postgres 16, one machine.</caption>
+    <thead><tr><th>Walk</th><th class="n">ms / question</th></tr></thead>
+    <tbody>
+      <tr><td class="name">first stage alone</td><td class="n">6.6</td></tr>
+      <tr><td class="name">ontology, regex graph</td><td class="n">9.1</td></tr>
+      <tr><td class="name">ontology, Haiku graph</td><td class="n">13.7</td></tr>
+      <tr><td class="name">two_step</td><td class="n">14.7</td></tr>
+      <tr><td class="name">DAG + SQL</td><td class="n">25.7</td></tr>
+    </tbody>
+  </table></div>
+  <p class="col">The DAG walk is two Postgres round trips per question (the recursive walk,
+  then the links among what it reached) over about 400 cards. Re-extracting 1,586 cards with
+  Haiku after the corpus changed took 31 minutes with zero errors; the DAG needs no extraction.</p>
+</section>
+
+<section>
+  <h2>What this does not establish</h2>
+  <div class="note">
+  <p><strong>A real corpus.</strong> The questions and the entity layer are planted in
+  synthetic text. The real share of questions whose evidence follows citations is unknown;
+  the verdict holds in both strata, so the mix would change its size, not its direction.</p>
+  <p><strong>The best DAG ranking.</strong> The DAG walk is cut at 3 hops and the ontology
+  walk is not, though both use the same seeds, walk and budget. A DAG-native score, such as
+  weighting shared references by how rare they are, was not tried and could close part of
+  the gap.</p>
+  <p><strong>A good extractor.</strong> Regex is an upper bound because it reads the corpus's
+  own templates. Haiku over-extracts made-up vocabulary; on real text it may do better or
+  worse.</p>
+  <p><strong>Good absolute recall.</strong> No method gets every hop on more than 17% of
+  questions, and on three-card bridges the two methods do not differ. This compares two
+  weak multi-hop retrievers.</p>
+  <p><strong>Abstention.</strong> Every method answers the no-answer questions (52 of 57);
+  a ranker always returns ten cards. That is scored with generated answers, not here.</p>
+  <p><strong>The LLM walker.</strong> An LLM-guided ontology walk exists
+  (<code>onto_llm_walk</code>), but its row here ran a scripted stand-in on 81 questions, so
+  it is evidence about the harness only.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Conclusion</h2>
+  <p class="col">For multi-hop questions over a research record, ingest an ontology. It
+  wins where the DAG has no path, and it wins where the DAG does, because a named entity
+  tells the walk what two documents share and a citation only tells it that they are
+  related. It also uses time better: its fact validity windows keep an as-of question on
+  the right version, which the DAG's dates never need to do.</p>
+
+  <p class="col">Two cautions travel with that. The advantage is only as large as the
+  extraction is clean: +0.160 with a perfect ontology, +0.028 with Haiku's. And the DAG is
+  not wasted: it is as-of correct for free, it orders evidence in time by its structure, and
+  it needs no extraction bill. The cheapest next step is a DAG ranking built for citations,
+  which would show how much of the gap is the walk rather than the graph.</p>
+
+  <p class="foot" style="margin-top:2.4em">Measured with <code>proofline_eval.py b5</code>
+  on the quick synthetic profile (reports <code>report-20260925T111748Z</code>, regex, and
+  <code>report-20260925T112122Z</code>, Haiku). Reproduce:
+  <code>uv run proofline_eval.py all --profile quick</code>, then
+  <code>uv run ingest_semantica.py --method regex</code> and
+  <code>--method llm --extract-limit 0</code>, then <code>uv run proofline_eval.py b5</code>
+  with <code>--extractor semantica:regex</code> or
+  <code>--extractor semantica:llm:anthropic:claude-haiku-4-5</code>.</p>
+</section>
+
+</div>

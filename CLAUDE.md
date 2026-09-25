@@ -162,6 +162,7 @@ branch_a_anchor.py    grade label sources by verdict agreement against a judge a
 judge_noise_floor.py  same pair twice in the SAME order, to separate a judge's
                       sampling noise from its position bias
 RESULTS.html          findings from the full four-branch run on 60k arXiv cards
+RESULTS-multihop.html B5 findings: DAG + SQL vs ontology on multi-hop and as-of questions
 ```
 
 ## Extending

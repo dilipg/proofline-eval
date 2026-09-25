@@ -217,7 +217,7 @@ single hop can answer (MuSiQue's disconnection filter), with its pair.
         --walker anthropic:claude-haiku-4-5 --llm-queries 40
 
 B5 asks which ingestion retrieves multi-hop evidence better: the DAG in Postgres or
-the extracted ontology. `dag_walk` is DAG + SQL: a recursive CTE in Postgres walks up to
+the extracted ontology (findings: [RESULTS-multihop.html](RESULTS-multihop.html)). `dag_walk` is DAG + SQL: a recursive CTE in Postgres walks up to
 3 undirected hops along the parent/citation edges that existed at the question's date
 (moving along a version chain is free: a version is the same paper), and the same
 personalized PageRank the ontology walk uses ranks what it reached, so only the graph
