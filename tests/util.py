@@ -30,3 +30,20 @@ def query(text, as_of_day, **fields):
                 rel={}, slices=[], answerable=True)
     base.update(fields)
     return pe.Query(**base)
+
+
+def flood(spec, n=12):
+    """Add n filler cards that match the question's first word, so the first stage's top
+    ten is all fillers and a card that shares no word with the question can only enter
+    the top k through the walk. With three or four cards, dense retrieval scores every
+    card and a walk test passes with no walk at all."""
+    return spec + [(f"N{i:02d}", 3, f"quanibraion filler{i} padding{i}", None) for i in range(n)]
+
+
+def load_dag(conn, spec, links):
+    """spec as for index_from; links: [(src, dst, day)] citations, valid from `day`."""
+    with conn.cursor() as cur:
+        for cid, d, _text, sup in spec:
+            cur.execute("INSERT INTO cards VALUES (%s, %s, %s)", (cid, day(d), sup))
+        for s, t, d in links:
+            cur.execute("INSERT INTO edges VALUES (%s, %s, 'citation', %s)", (s, t, day(d)))

@@ -622,6 +622,9 @@ def plant_entities(cards: list[Card], vocab: set[str], seed: int
 MH_FAMILIES = ("bridge", "bridge3", "chrono_asof", "timeline", "history",
                "aggregate_set", "aggregate_count")
 LAST_HOP_FAMILIES = ("bridge", "bridge3", "chrono_asof")
+# How far the DAG method walks, and how far "reachable along the DAG" means when a
+# question is stratified: bridge3 is asker -> introducer -> extended introducer -> reporter
+DAG_HOPS = 3
 # {mkind} names the method's ontology kind: card A often uses several methods, and a
 # question must pick out one of them (see `sole` below)
 _MH_CUE = {
@@ -1455,6 +1458,7 @@ CREATE TABLE IF NOT EXISTS cards (
 CREATE INDEX IF NOT EXISTS cards_fts    ON cards USING gin (fts);
 CREATE INDEX IF NOT EXISTS cards_asof   ON cards (committed_at);
 CREATE INDEX IF NOT EXISTS cards_pl     ON cards (proofline_id);
+CREATE INDEX IF NOT EXISTS cards_sup    ON cards (supersedes_id);
 
 -- edges: structural (author-recorded) vs planted truth, kept apart on purpose.
 -- Only 'parent' and 'citation' are observable in a real deployment. 'true_support'
@@ -2112,8 +2116,8 @@ class Scorer:
     uses_ontology = False
     description = ""
 
-    def prepare(self, idx: Index, embedder: Embedder) -> None:
-        self.idx, self.embedder = idx, embedder
+    def prepare(self, idx: Index, embedder: Embedder, store: Any = None) -> None:
+        self.idx, self.embedder, self.store = idx, embedder, store
 
     def run(self, q: Query, k: int) -> Scored:
         raise NotImplementedError
@@ -2130,16 +2134,16 @@ class Scorer:
         sc = [y for _, y in pairs]
         return Scored(ids, sc, sc[0] if sc else 0.0)
 
-    def _emit_hops(self, fs: dict[int, float], second: dict[int, float], k: int) -> Scored:
+    def _emit_hops(self, fs: dict[int, float], second: dict[int, float], k: int,
+                   walk_order: Optional[dict[int, int]] = None) -> Scored:
         """Spend the top k on BOTH hops: the first stage's best half, then what the second
         hop discovered (cards the first stage did not seed), then the remaining seeds by
         the second hop's score. Fused into one list instead, the ten seeds fill the top
         ten: on smoke the ontology walk ranked the bridge card first among its
         discoveries in 27 of 36 bridge queries, and in the fused top ten in none.
 
-        The chain is ordered by when each card was written (metadata, as with
-        supersession); the abstention score is the FIRST STAGE's top, so every scorer that
-        shares that stage shares a threshold."""
+        The abstention score is the FIRST STAGE's top, so every scorer that shares that
+        stage shares a threshold."""
         first = ranked_ids(fs)
         seeds = set(first[:10])
         head = first[:max(1, k // 2)]
@@ -2147,7 +2151,12 @@ class Scorer:
         rest = sorted((i for i in seeds if i not in head), key=lambda i: (-second.get(i, 0.0), i))
         order = list(dict.fromkeys(head + found + rest + first[10:]))[:k]
         ids = [self.idx.ids[i] for i in order]
-        chain = [self.idx.ids[i] for i in sorted(order, key=lambda i: (self.idx.ts[i], i))]
+        # The chain is the scorer's own evidence order: its ranking, or for a walk the
+        # order it reached cards (depth). The harness never sorts it by date: a sort
+        # would hand every method order_tau = 1.0 and measure nothing.
+        chain = ids if walk_order is None else [
+            self.idx.ids[i] for i in sorted(order, key=lambda i: (walk_order.get(i, DAG_HOPS + 1),
+                                                                  order.index(i)))]
         return Scored(ids, [1.0 / (r + 1) for r in range(len(ids))],
                       max(fs.values(), default=0.0), chain)
 
@@ -2249,8 +2258,8 @@ class CrossEncoderRerank(Scorer):
     MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     CAND = 50
 
-    def prepare(self, idx, embedder):
-        super().prepare(idx, embedder)
+    def prepare(self, idx, embedder, store=None):
+        super().prepare(idx, embedder, store)
         ce = _CE_CACHE.get(self.MODEL)
         if ce is None:
             from sentence_transformers import CrossEncoder
@@ -2299,31 +2308,95 @@ class TwoStep(Scorer):
         return self._emit_hops(fs, fs2, k)
 
 
+DAG_WALK_SQL = """
+WITH RECURSIVE walk(node, depth) AS (
+    SELECT s, 0 FROM unnest(%(seeds)s::text[]) AS s
+  UNION
+    SELECT n.nbr, w.depth + 1
+    FROM walk w
+    CROSS JOIN LATERAL (
+        SELECT e.dst AS nbr FROM edges e
+         WHERE e.src = w.node AND e.kind IN ('parent', 'citation')
+           AND (%(blind)s OR e.valid_from <= %(t)s)
+        UNION ALL
+        SELECT e.src FROM edges e
+         WHERE e.dst = w.node AND e.kind IN ('parent', 'citation')
+           AND (%(blind)s OR e.valid_from <= %(t)s)
+        UNION ALL
+        SELECT c.supersedes_id FROM cards c
+         WHERE c.id = w.node AND c.supersedes_id IS NOT NULL
+           AND (%(blind)s OR c.committed_at <= %(t)s)
+        UNION ALL
+        SELECT c.id FROM cards c
+         WHERE c.supersedes_id = w.node AND (%(blind)s OR c.committed_at <= %(t)s)
+    ) AS n
+    WHERE w.depth < %(hops)s
+)
+SELECT node, min(depth) AS depth FROM walk GROUP BY node
+"""
+
+DAG_LINKS_SQL = """
+SELECT src AS a, dst AS b FROM edges
+ WHERE kind IN ('parent', 'citation') AND src = ANY(%(nodes)s) AND dst = ANY(%(nodes)s)
+   AND (%(blind)s OR valid_from <= %(t)s)
+UNION ALL
+SELECT id, supersedes_id FROM cards
+ WHERE supersedes_id = ANY(%(nodes)s) AND id = ANY(%(nodes)s)
+   AND (%(blind)s OR committed_at <= %(t)s)
+"""
+
+
+def dag_neighbourhood(conn, seeds: Sequence[str], as_of: datetime, hops: int = DAG_HOPS,
+                      time_blind: bool = False) -> tuple[dict[str, int], list[tuple[str, str]]]:
+    """The DAG method's traversal, in SQL: every card within `hops` undirected steps of
+    the seeds along the parent/citation edges and supersession links that existed at
+    as_of, with its depth, then the links among those cards. time_blind drops every
+    date: the ablation that shows what links made after the question would buy."""
+    args = dict(seeds=list(seeds), t=as_of, blind=time_blind, hops=hops)
+    with conn.cursor() as cur:
+        cur.execute(DAG_WALK_SQL, args)
+        depth = {r["node"]: int(r["depth"]) for r in cur.fetchall()}
+        cur.execute(DAG_LINKS_SQL, dict(args, nodes=list(depth)))
+        links = [(r["a"], r["b"]) for r in cur.fetchall()]
+    return depth, links
+
+
 class DagWalk(Scorer):
-    """The DAG method: one hop along the author-recorded parent/citation edges that
-    existed at as_of, from the first stage's top 10."""
+    """The DAG + SQL method. From the first stage's top 10, a recursive CTE in Postgres
+    walks up to DAG_HOPS undirected steps along the parent/citation edges and
+    supersession links that existed at as_of; the SAME personalized PageRank as the
+    ontology walk ranks what it reached. Only the graph differs between the two."""
     name = "dag_walk"
     uses_graph = True
-    description = "first stage, then one hop along parent/citation edges valid at as_of."
+    time_blind = False
+    description = "first stage, then PPR over the as-of DAG neighbourhood a Postgres recursive CTE fetches."
 
     def run(self, q, k):
+        if getattr(self, "store", None) is None:
+            raise SystemExit(f"{self.name} walks the edges table in Postgres: prepare it with a store")
         ok = pool(self.idx, q)
+        snap = self.idx.snapshot_mask(q.as_of)
         fs = first_stage(self.idx, self.embedder, q)
-        t = q.as_of.timestamp()
-        # seeds keep their own score in the expansion list, or a neighbour that also
-        # sits in the first stage (dense scores every card) counts twice and outranks
-        # the card that actually matched the question
         seeds = ranked_ids(fs)[:10]
-        exp: dict[int, float] = {i: fs[i] for i in seeds}
+        depth, links = dag_neighbourhood(self.store.conn, [self.idx.ids[i] for i in seeds],
+                                         q.as_of, DAG_HOPS, self.time_blind)
+        nodes = [c for c in depth if c in self.idx.pos]
+        local = {c: j for j, c in enumerate(nodes)}
+        pairs = [(local[a], local[b]) for a, b in links if a in local and b in local]
+        # a card may carry mass only if it existed at as_of (the ablation lifts this;
+        # what is RETURNED is masked by the pool either way)
+        carry = np.array([self.time_blind or bool(snap[self.idx.pos[c]]) for c in nodes], dtype=bool)
+        pairs = [(a, b) for a, b in pairs if carry[a] and carry[b]]
+        src = np.asarray([a for a, b in pairs] + [b for a, b in pairs], dtype=np.int64)
+        dst = np.asarray([b for a, b in pairs] + [a for a, b in pairs], dtype=np.int64)
+        p0 = np.zeros(len(nodes))
         for i in seeds:
-            cid = self.idx.ids[i]
-            nbrs = list(self.idx.graph.get(cid, ())) + [s for s, ts in self.idx.cited_by.get(cid, ())
-                                                        if ts <= t]
-            for n in nbrs:
-                j = self.idx.pos.get(n)
-                if j is not None and ok[j]:
-                    exp[j] = max(exp.get(j, 0.0), 0.5 * fs[i])
-        return self._emit_hops(fs, exp, k)
+            p0[local[self.idx.ids[i]]] = fs[i]
+        p = ppr_walk(len(nodes), src, dst, p0)
+        second = {self.idx.pos[c]: float(p[j]) for c, j in local.items()
+                  if p[j] > 0 and ok[self.idx.pos[c]]}
+        walk_order = {self.idx.pos[c]: d for c, d in depth.items() if c in self.idx.pos}
+        return self._emit_hops(fs, second, k, walk_order=walk_order)
 
 
 class OntoWalk(Scorer):
@@ -3185,7 +3258,7 @@ def execute_run(store: Store, scorer: Scorer, embedder: Embedder,
         chains: dict[str, list[str]] = {}
         if queries:
             idx = build_index(store, corpus_n, keep, extractor)
-            scorer.prepare(idx, embedder)
+            scorer.prepare(idx, embedder, store)
             for q in queries:
                 out = scorer.run(q, k)
                 tops[q.id] = out.top_score

@@ -21,25 +21,6 @@ def test_pool_is_intent_aware():
     assert not cur[idx.pos["B"]] and hist[idx.pos["B"]] and cur[idx.pos["B2"]]
 
 
-def test_dag_walk_reaches_the_cited_card():
-    sc = pe.DagWalk()
-    sc.prepare(_idx(), EMB)
-    out = sc.run(query("quanibraion modrievment lattilency", 6), 5)
-    assert out.ids[0] == "A" and "B" in out.ids
-    assert out.chain == sorted(out.chain, key=lambda c: {"A": 5, "B": 2, "B2": 8, "N": 3}[c])
-    assert pe.DagWalk.uses_graph
-
-
-def test_dag_walk_follows_citations_backwards_too():
-    # from the cited card B, the walk must reach its citer A through cited_by
-    idx = _idx()
-    assert idx.cited_by["B"] == [("A", day(5).timestamp())]
-    sc = pe.DagWalk()
-    sc.prepare(idx, EMB)
-    out = sc.run(query("thermoulaity caltroposis isostabity", 6), 5)
-    assert out.ids[0] == "B" and "A" in out.ids
-
-
 def test_two_step_uses_feedback_terms_without_the_graph():
     sc = pe.TwoStep()
     sc.prepare(_idx(), EMB)
@@ -56,9 +37,10 @@ FLOOD = [("A", 5, "quanibraion modrievment lattilency calibrated", None),
         [(f"N{i:02d}", 3, f"quanibraion filler{i} padding{i}", None) for i in range(12)]
 
 
-def test_dag_walk_spends_part_of_k_on_the_second_hop():
-    idx = index_from(FLOOD)
-    idx.attach_graph([("A", "B", day(5))])
+def test_dag_walk_spends_part_of_k_on_the_second_hop(dag_db):
+    from types import SimpleNamespace
+    from util import load_dag
+    load_dag(dag_db, FLOOD, [("A", "B", 5)])
     sc = pe.DagWalk()
-    sc.prepare(idx, EMB)
+    sc.prepare(index_from(FLOOD), EMB, SimpleNamespace(conn=dag_db))
     assert "B" in sc.run(query("quanibraion modrievment lattilency", 6), 10).ids
